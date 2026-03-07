@@ -53,7 +53,9 @@ pub struct CourseTimetable {
     #[serde(default)]
     pub classroom_name: Option<String>,
     /// 实验课各次实验内容
-    #[serde_as(deserialize_as = "StringWithSeparator::<CommaSeparator, String>")]
+    #[serde_as(
+        deserialize_as = "serde_with::DefaultOnNull<StringWithSeparator::<CommaSeparator, String>>"
+    )]
     #[serde(alias = "exprProjectName")]
     #[serde(default)]
     pub expr_projects: Vec<String>,
