@@ -59,13 +59,13 @@ impl<'de> Deserialize<'de> for CourseDayTime {
                             }
                         }
                         Field::WeekDayFormat => {
-                            if weekday.is_none() {
-                                if let Some(weekday_str) = map.next_value::<Option<String>>()? {
-                                    weekday =
-                                        Some(parse_weekday(&weekday_str).ok_or_else(|| {
-                                            serde::de::Error::custom("Invalid weekday")
-                                        })?);
-                                }
+                            if weekday.is_none()
+                                && let Some(weekday_str) = map.next_value::<Option<String>>()?
+                            {
+                                weekday =
+                                    Some(parse_weekday(&weekday_str).ok_or_else(|| {
+                                        serde::de::Error::custom("Invalid weekday")
+                                    })?);
                             }
                         }
                         Field::Period => {
@@ -74,13 +74,13 @@ impl<'de> Deserialize<'de> for CourseDayTime {
                             }
                         }
                         Field::PeriodFormat => {
-                            if period.is_none() {
-                                if let Some(period_str) = map.next_value::<Option<String>>()? {
-                                    period =
-                                        Some(Period::parse_period_str(&period_str).ok_or_else(
-                                            || serde::de::Error::custom("Invalid period"),
-                                        )?);
-                                }
+                            if period.is_none()
+                                && let Some(period_str) = map.next_value::<Option<String>>()?
+                            {
+                                period =
+                                    Some(Period::parse_period_str(&period_str).ok_or_else(
+                                        || serde::de::Error::custom("Invalid period"),
+                                    )?);
                             }
                         }
                         Field::Unknown => {
