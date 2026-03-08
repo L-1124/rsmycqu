@@ -56,31 +56,39 @@ impl<'de> Deserialize<'de> for CourseDayTime {
                         Field::WeekDay => {
                             if weekday.is_none() {
                                 weekday = map.next_value().ok();
+                            } else {
+                                map.next_value::<serde::de::IgnoredAny>()?;
                             }
                         }
                         Field::WeekDayFormat => {
-                            if weekday.is_none()
-                                && let Some(weekday_str) = map.next_value::<Option<String>>()?
-                            {
-                                weekday =
-                                    Some(parse_weekday(&weekday_str).ok_or_else(|| {
-                                        serde::de::Error::custom("Invalid weekday")
-                                    })?);
+                            if weekday.is_none() {
+                                if let Some(weekday_str) = map.next_value::<Option<String>>()? {
+                                    weekday =
+                                        Some(parse_weekday(&weekday_str).ok_or_else(|| {
+                                            serde::de::Error::custom("Invalid weekday")
+                                        })?);
+                                }
+                            } else {
+                                map.next_value::<serde::de::IgnoredAny>()?;
                             }
                         }
                         Field::Period => {
                             if period.is_none() {
                                 period = map.next_value().ok();
+                            } else {
+                                map.next_value::<serde::de::IgnoredAny>()?;
                             }
                         }
                         Field::PeriodFormat => {
-                            if period.is_none()
-                                && let Some(period_str) = map.next_value::<Option<String>>()?
-                            {
-                                period =
-                                    Some(Period::parse_period_str(&period_str).ok_or_else(
-                                        || serde::de::Error::custom("Invalid period"),
-                                    )?);
+                            if period.is_none() {
+                                if let Some(period_str) = map.next_value::<Option<String>>()? {
+                                    period =
+                                        Some(Period::parse_period_str(&period_str).ok_or_else(
+                                            || serde::de::Error::custom("Invalid period"),
+                                        )?);
+                                }
+                            } else {
+                                map.next_value::<serde::de::IgnoredAny>()?;
                             }
                         }
                         Field::Unknown => {
@@ -102,6 +110,51 @@ impl<'de> Deserialize<'de> for CourseDayTime {
 }
 
 impl ApiModel for CourseDayTime {}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn test_deserialize_prefers_raw_fields_and_consumes_formatted_values() {
+        let course_day_time: CourseDayTime = serde_json::from_value(json!({
+            "weekDay": 4,
+            "weekDayFormat": "星期五",
+            "period": [3, 4],
+            "periodFormat": "3-4节",
+        }))
+        .unwrap();
+
+        assert_eq!(
+            course_day_time,
+            CourseDayTime {
+                weekday: 4,
+                period: Period { start: 3, end: 4 },
+            }
+        );
+    }
+
+    #[test]
+    fn test_deserialize_accepts_null_formatted_fields() {
+        let course_day_time: CourseDayTime = serde_json::from_value(json!({
+            "weekDay": 4,
+            "weekDayFormat": null,
+            "period": [3, 4],
+            "periodFormat": null,
+        }))
+        .unwrap();
+
+        assert_eq!(
+            course_day_time,
+            CourseDayTime {
+                weekday: 4,
+                period: Period { start: 3, end: 4 },
+            }
+        );
+    }
+}
 
 impl CourseDayTime {
     /// 获取星期的较短中文表示

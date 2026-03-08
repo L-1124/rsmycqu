@@ -103,11 +103,28 @@ impl Card {
         );
 
         if let Some(Value::Array(data)) = json.get_mut("objs").map(Value::take) {
+            let available_card_types: Vec<String> = data
+                .iter()
+                .filter_map(|value| {
+                    value
+                        .get("cardTypeName")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect();
+
             let card = data
                 .into_iter()
                 .find(|value| value.get("cardTypeName").and_then(Value::as_str) == Some("正式卡"))
-                .ok_or(ApiError::Website {
-                    msg: "No formal card found".to_string(),
+                .ok_or_else(|| ApiError::Website {
+                    msg: format!(
+                        "No formal card ('正式卡') found. Available cardTypeName values: {}",
+                        if available_card_types.is_empty() {
+                            "none".to_string()
+                        } else {
+                            available_card_types.join(", ")
+                        }
+                    ),
                 })?;
 
             serde_json::from_value(card).map_err(|err| ApiError::ModelParse {
