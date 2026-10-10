@@ -20,9 +20,14 @@ pub(super) enum LoginPageResponse {
     NormalLogin { login_page_data: SSOLoginPageData },
 }
 
-async fn launch_normal_login_result(res: Response) -> SSOResult<LoginPageResponse> {
+async fn launch_normal_login_result(
+    session: &Session,
+    res: Response,
+) -> SSOResult<LoginPageResponse> {
+    let html = res.text().await?;
+    session.set_ruishu_challenge_from_page(&html);
     Ok(LoginPageResponse::NormalLogin {
-        login_page_data: sso_login_parser(&res.text().await?).ok_or(ApiError::Website {
+        login_page_data: sso_login_parser(&html).ok_or(ApiError::Website {
             msg: "Failed to parse login page".to_string(),
         })?,
     })
@@ -40,7 +45,7 @@ pub(super) async fn get_login_request_data(
             if force_relogin {
                 logout(client, session).await?;
                 let local_res = session.execute(client.get(SSO_LOGIN_URL)).await?;
-                return launch_normal_login_result(local_res).await;
+                return launch_normal_login_result(session, local_res).await;
             }
 
             let jump_url =
@@ -54,7 +59,7 @@ pub(super) async fn get_login_request_data(
                     .to_string(),
             })
         }
-        StatusCode::OK => launch_normal_login_result(res).await,
+        StatusCode::OK => launch_normal_login_result(session, res).await,
         other => Err(SSOError::UnknownSSOError {
             msg: format!(
                 "status code {} is got (302 expected) when sending login post, \

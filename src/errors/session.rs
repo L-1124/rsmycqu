@@ -13,4 +13,11 @@ pub enum SessionError {
         /// 错误信息
         source: ReqwestError,
     },
+
+    /// 瑞数防护参数解析或加解密错误
+    #[snafu(display("Ruishu Error: {msg}"))]
+    RuishuError {
+        /// 错误原因描述
+        msg: String,
+    },
 }
