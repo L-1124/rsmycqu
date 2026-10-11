@@ -168,7 +168,7 @@ impl CQUSession {
     /// # async fn async_fetch_all_cqu_session() {
     /// # let client = Client::default();
     /// # let mut session = Session::new();
-    /// login(&client, &mut session, "your_auth", "your_password", false).await.unwrap();
+    /// login(&client, &mut session, "your_auth", "your_password", false, None).await.unwrap();
     /// access_mycqu(&client, &mut session).await.unwrap();
     /// let cqu_sessions = CQUSession::fetch_all(&client, &session);
     /// # }

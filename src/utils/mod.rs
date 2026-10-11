@@ -83,7 +83,7 @@ pub(crate) mod encrypt;
 #[cfg(feature = "sso")]
 pub(crate) mod page_parser;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sso"))]
 pub(crate) mod test_fixture;
 
 #[inline]

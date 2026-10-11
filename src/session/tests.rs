@@ -286,7 +286,15 @@ async fn ruishu_412_auto_resolves_protected_endpoint() {
     drop(blocked);
 
     // 登录页是瑞数挑战页，库内解析时会记住 cd/nsd（此处以 login 触发一次页面请求）
-    let _ = crate::sso::login(&client, &mut session, "probe_auth", "probe_pwd", false).await;
+    let _ = crate::sso::login(
+        &client,
+        &mut session,
+        "probe_auth",
+        "probe_pwd",
+        false,
+        None,
+    )
+    .await;
 
     // 再次请求：412 → 用页面挑战纯算补 basearr 与 Cookie T → 重发
     let res = session

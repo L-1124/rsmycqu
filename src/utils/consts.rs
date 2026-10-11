@@ -73,6 +73,25 @@ pub(crate) const SSO_LOGIN_URL: &str = formatcp!("{SSO_ROOT_URL}/login");
 #[cfg(feature = "sso")]
 pub(crate) const SSO_LOGOUT_URL: &str = formatcp!("{SSO_ROOT_URL}/logout");
 
+#[cfg(feature = "sso")]
+pub(crate) const SSO_CAPTCHA_URL: &str = formatcp!("{SSO_ROOT_URL}/api/captcha/generate/DEFAULT");
+
+#[cfg(feature = "sso")]
+pub(crate) const SSO_SEND_SMS_CODE_URL: &str =
+    formatcp!("{SSO_ROOT_URL}/api/protected/sms/publicNoToken/sendSmsCode");
+
+#[cfg(feature = "sso")]
+pub(crate) const SSO_SEND_MAIL_CODE_URL: &str =
+    formatcp!("{SSO_ROOT_URL}/api/protected/mail/publicNoToken/sendMailCode4SecondAuth");
+
+#[cfg(feature = "sso")]
+pub(crate) const SSO_PHONE_BINDING_URL: &str =
+    formatcp!("{SSO_ROOT_URL}/api/protected/sms/getPhoneNumberByUserId");
+
+#[cfg(feature = "sso")]
+pub(crate) const SSO_MAIL_BINDING_URL: &str =
+    formatcp!("{SSO_ROOT_URL}/api/protected/mail/publicNoToken/findMail");
+
 #[cfg(feature = "card")]
 pub(crate) const CARD_SERVICE_URL: &str = "http://card.cqu.edu.cn:7280/ias/prelogin?sysid=FWDT";
 

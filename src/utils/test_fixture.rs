@@ -8,8 +8,9 @@ use rstest::*;
 
 #[cfg(feature = "card")]
 use crate::card::access_card;
+#[cfg(feature = "mycqu")]
+use crate::mycqu::access_mycqu;
 use crate::{
-    mycqu::access_mycqu,
     session::{Client, Session},
     sso::{LoginResult, login},
 };
@@ -34,6 +35,7 @@ pub(crate) fn login_data() -> LoginData {
 #[derive(Hash, Eq, PartialEq)]
 pub(crate) enum SessionType {
     Login,
+    #[cfg(feature = "mycqu")]
     AccessMycqu,
     #[cfg(feature = "card")]
     AccessCard,
@@ -94,6 +96,7 @@ pub(crate) async fn login_session(
                 &login_data.auth,
                 &login_data.password,
                 false,
+                None,
             )
             .await;
 
@@ -110,6 +113,7 @@ pub(crate) async fn login_session(
     }
 }
 
+#[cfg(feature = "mycqu")]
 #[fixture]
 pub(crate) async fn access_mycqu_session(
     session_map: &ShareSessionMap,

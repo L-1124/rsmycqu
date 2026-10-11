@@ -111,7 +111,7 @@ impl CQUSessionInfo {
     /// # async fn async_fetch_all_cqu_session_info() {
     /// # let client = Client::default();
     /// # let mut session = Session::new();
-    /// login(&client, &mut session, "your_auth", "your_password", false).await.unwrap();
+    /// login(&client, &mut session, "your_auth", "your_password", false, None).await.unwrap();
     /// access_mycqu(&client, &mut session).await.unwrap();
     /// let cqu_session_infos = CQUSessionInfo::fetch_all(&client, &session);
     /// # }
@@ -139,7 +139,7 @@ impl CQUSessionInfo {
     /// # async fn async_fetch_all_cqu_session_info() {
     /// # let client = Client::default();
     /// # let mut session = Session::new();
-    /// login(&client, &mut session, "your_auth", "your_password", false).await.unwrap();
+    /// login(&client, &mut session, "your_auth", "your_password", false, None).await.unwrap();
     /// access_mycqu(&client, &mut session).await.unwrap();
     /// let curr_cqu_session_info = CQUSessionInfo::fetch_curr(&client, &session);
     /// # }
@@ -165,7 +165,7 @@ impl CQUSessionInfo {
     /// # async fn async_fetch_cqu_session_detail_info() {
     /// # let client = Client::default();
     /// # let mut session = Session::new();
-    /// login(&client, &mut session, "your_auth", "your_password", false).await.unwrap();
+    /// login(&client, &mut session, "your_auth", "your_password", false, None).await.unwrap();
     /// access_mycqu(&client, &mut session).await.unwrap();
     /// let cqu_session_info = CQUSessionInfo::fetch_detail(&client, &session, 1059);
     /// # }

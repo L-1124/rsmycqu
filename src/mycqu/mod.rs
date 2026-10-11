@@ -75,7 +75,7 @@ impl User {
     /// # async fn fetch_user() {
     /// # let client = Client::default();
     /// # let mut session = Session::new();
-    /// login(&client, &mut session, "your_auth", "your_password", false).await.unwrap();
+    /// login(&client, &mut session, "your_auth", "your_password", false, None).await.unwrap();
     /// access_mycqu(&client, &mut session).await.unwrap();
     /// let user = User::fetch_self(&client, &session);
     /// # }

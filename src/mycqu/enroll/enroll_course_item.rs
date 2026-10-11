@@ -78,7 +78,7 @@ impl EnrollCourseItem {
     /// # let client = Client::default();
     /// # let mut session = Session::new();
     /// let cqu_session = CQUSession{ id: Some(1234), year: 2023, is_autumn: true };
-    /// login(&client, &mut session, "your_auth", "your_password", false).await.unwrap();
+    /// login(&client, &mut session, "your_auth", "your_password", false, None).await.unwrap();
     /// access_mycqu(&client, &mut session).await.unwrap();
     /// let user = EnrollCourseItem::fetch_all(&client, &session, "target_course_id", true);
     /// # }

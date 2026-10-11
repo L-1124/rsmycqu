@@ -16,6 +16,7 @@ pub mod mycqu;
 pub mod card;
 
 mod sealed {
+    #[cfg(feature = "sso")]
     use crate::errors::sso;
 
     pub trait Sealed {}

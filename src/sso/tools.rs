@@ -77,8 +77,9 @@ pub(super) fn launch_login_data(
     username: impl AsRef<str>,
     password: impl AsRef<str>,
     login_page_data: &SSOLoginPageData,
-) -> SSOResult<[(&'static str, String); 7]> {
-    Ok([
+    captcha_code: Option<&str>,
+) -> SSOResult<Vec<(&'static str, String)>> {
+    let mut data = vec![
         ("username", username.as_ref().to_owned()),
         ("type", "UsernamePassword".to_string()),
         ("_eventId", "submit".to_string()),
@@ -89,5 +90,31 @@ pub(super) fn launch_login_data(
             "password",
             encrypt_password(&login_page_data.login_croypto, password)?,
         ),
-    ])
+    ];
+
+    if let Some(code) = captcha_code {
+        data.push(("captcha_code", code.to_owned()));
+        if !login_page_data.captcha_payload.is_empty() {
+            data.push(("captcha_payload", login_page_data.captcha_payload.clone()));
+        }
+    }
+    Ok(data)
+}
+
+#[inline]
+pub(super) fn launch_second_factor_data(
+    username: impl AsRef<str>,
+    code: impl AsRef<str>,
+    kind: impl AsRef<str>,
+    execution: impl AsRef<str>,
+) -> [(&'static str, String); 7] {
+    [
+        ("username", username.as_ref().to_owned()),
+        ("password", code.as_ref().to_owned()),
+        ("type", kind.as_ref().to_owned()),
+        ("_eventId", "submit".to_string()),
+        ("geolocation", "".to_string()),
+        ("execution", execution.as_ref().to_owned()),
+        ("captcha_code", "".to_string()),
+    ]
 }

@@ -76,7 +76,7 @@ impl Card {
     /// # async fn fetch_card() {
     /// # let client = Client::default();
     /// # let mut session = Session::new();
-    /// login(&client, &mut session, "your_auth", "your_password", false).await.unwrap();
+    /// login(&client, &mut session, "your_auth", "your_password", false, None).await.unwrap();
     /// access_card(&client, &mut session).await.unwrap();
     /// let card = Card::fetch_self(&client, &mut session).await.unwrap();
     /// # }
@@ -157,7 +157,7 @@ impl Card {
     /// # async fn fetch_bill() {
     /// # let client = Client::default();
     /// # let mut session = Session::new();
-    /// login(&client, &mut session, "your_auth", "your_password", false).await.unwrap();
+    /// login(&client, &mut session, "your_auth", "your_password", false, None).await.unwrap();
     /// access_card(&client, &mut session).await.unwrap();
     /// let card = Card::fetch_self(&client, &mut session).await.unwrap();
     /// let bills = card.fetch_bill(&client, &session, "2023-11-10", "2023-12-12", 1, 100).await.unwrap();

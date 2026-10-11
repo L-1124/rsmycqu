@@ -134,7 +134,7 @@ impl EnergyFees {
     /// # async fn fetch_dorm_fee() {
     /// # let client = Client::default();
     /// # let mut session = Session::new();
-    /// login(&client, &mut session, "your_auth", "your_password", false).await.unwrap();
+    /// login(&client, &mut session, "your_auth", "your_password", false, None).await.unwrap();
     /// access_card(&client, &mut session).await.unwrap();
     /// let fees = EnergyFees::fetch_self(&client, &mut session, "b5321", true);
     /// # }
