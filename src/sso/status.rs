@@ -1,11 +1,28 @@
 //! SSO 在线会话有效性检查。
 
-use reqwest::Url;
+use reqwest::{StatusCode, Url};
+use serde::{Deserialize, Serialize};
 
-use crate::errors::{ApiError, sso::SSOResult};
+use crate::{
+    errors::{
+        ApiError,
+        sso::{SSOError, SSOResult},
+    },
+    session::{Client, Session},
+    utils::{consts::SSO_LOGIN_URL, get_response_header, page_parser::sso_login_parser},
+};
 
 #[cfg(test)]
 mod tests;
+
+/// SSO 在线会话有效性状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SsoSessionStatus {
+    /// 统一身份认证会话有效（已登录）。
+    Authenticated,
+    /// 统一身份认证会话无效（未登录）。
+    Unauthenticated,
+}
 
 pub(super) fn is_exact_cas_success_callback(target: &Url) -> bool {
     target.scheme() == "https"
@@ -53,4 +70,153 @@ pub(super) fn validate_login_redirect(base: &Url, target: &Url) -> SSOResult<()>
     Err(ApiError::Website {
         msg: "SSO redirect rejected: cross-origin redirect".to_string(),
     })
+}
+
+fn validate_redirect(base: &Url, target: &Url, visited: &[&Url]) -> SSOResult<()> {
+    validate_login_redirect(base, target)?;
+    if visited
+        .iter()
+        .any(|url| url.path() == target.path() && url.query() == target.query())
+    {
+        return Err(ApiError::Website {
+            msg: "SSO redirect cycle detected".to_string(),
+        });
+    }
+    Ok(())
+}
+
+async fn confirm_cas_authenticated(
+    client: &Client,
+    session: &Session,
+) -> SSOResult<SsoSessionStatus> {
+    let confirm_res = session.execute(client.get(SSO_LOGIN_URL)).await?;
+    match confirm_res.status() {
+        StatusCode::FOUND => {
+            let loc = get_response_header(&confirm_res, "Location")
+                .ok_or_else(ApiError::location_error)?;
+            let target_url = confirm_res.url().join(loc).map_err(|_| ApiError::Website {
+                msg: "Invalid SSO redirect URI format".to_string(),
+            })?;
+            validate_redirect(confirm_res.url(), &target_url, &[confirm_res.url()])?;
+            Ok(SsoSessionStatus::Authenticated)
+        }
+        StatusCode::OK => {
+            let html = confirm_res.text().await?;
+            if sso_login_parser(&html).is_some() {
+                Ok(SsoSessionStatus::Unauthenticated)
+            } else {
+                Err(ApiError::ModelParse {
+                    msg: "SSO endpoint returned HTTP 200 OK without valid login page flowkey"
+                        .to_string(),
+                })
+            }
+        }
+        other => Err(ApiError::HttpStatus { status: other }),
+    }
+}
+
+/// 检查当前统一身份认证（SSO）会话在服务端的在线有效性。
+///
+/// 只读探测，不提交凭据，不发送验证码，不跟随不受信跨源重定向。
+/// 若会话存在未完成的多步待办认证（[`session.pending_login`]），
+/// 为避免干扰进行中的服务端 CAS 流程，直接返回 [`SSOError::InvalidPendingState`]。
+/// # 返回值
+/// - [`Ok(SsoSessionStatus::Authenticated)`]：会话在 SSO 系统的在线凭据确证有效（通过 CAS 重定向链与一致性状态确认）。
+/// - [`Ok(SsoSessionStatus::Unauthenticated)`]：服务端返回结构可靠的登录页，确证当前未登录。
+/// - [`Err`]：网络传输错误、超时、WAF 412 拦截、服务端 5xx 故障或无法解析的非预期响应。
+pub async fn check_sso_session(client: &Client, session: &Session) -> SSOResult<SsoSessionStatus> {
+    if session.pending_login.is_some() {
+        return Err(SSOError::InvalidPendingState {
+            msg: "cannot check online sso session while an active pending authentication is in progress".to_string(),
+        }.into());
+    }
+
+    let res = session.execute(client.get(SSO_LOGIN_URL)).await?;
+
+    match res.status() {
+        StatusCode::OK => {
+            let html = res.text().await?;
+            if sso_login_parser(&html).is_some() {
+                Ok(SsoSessionStatus::Unauthenticated)
+            } else {
+                Err(ApiError::ModelParse {
+                    msg: "SSO endpoint returned HTTP 200 OK without valid login page flowkey"
+                        .to_string(),
+                })
+            }
+        }
+        StatusCode::FOUND => {
+            let location =
+                get_response_header(&res, "Location").ok_or_else(ApiError::location_error)?;
+            let redirect_url = res.url().join(location).map_err(|_| ApiError::Website {
+                msg: "Invalid SSO redirect URI format".to_string(),
+            })?;
+
+            validate_redirect(res.url(), &redirect_url, &[res.url()])?;
+
+            if is_exact_cas_success_callback(&redirect_url) {
+                return confirm_cas_authenticated(client, session).await;
+            }
+
+            let jump_res = session.execute(client.get(redirect_url)).await?;
+            match jump_res.status() {
+                StatusCode::FOUND => {
+                    let loc2 = get_response_header(&jump_res, "Location")
+                        .ok_or_else(ApiError::location_error)?;
+                    let redirect_url2 =
+                        jump_res.url().join(loc2).map_err(|_| ApiError::Website {
+                            msg: "Invalid secondary SSO redirect URI format".to_string(),
+                        })?;
+
+                    validate_redirect(
+                        jump_res.url(),
+                        &redirect_url2,
+                        &[res.url(), jump_res.url()],
+                    )?;
+
+                    let landing_res = session.execute(client.get(redirect_url2)).await?;
+                    if landing_res.status().is_success() {
+                        let html = landing_res.text().await?;
+                        if sso_login_parser(&html).is_some() {
+                            Ok(SsoSessionStatus::Unauthenticated)
+                        } else {
+                            confirm_cas_authenticated(client, session).await
+                        }
+                    } else if landing_res.status() == StatusCode::FOUND {
+                        let loc3 = get_response_header(&landing_res, "Location")
+                            .ok_or_else(ApiError::location_error)?;
+                        let redirect_url3 =
+                            landing_res
+                                .url()
+                                .join(loc3)
+                                .map_err(|_| ApiError::Website {
+                                    msg: "Invalid tertiary SSO redirect URI format".to_string(),
+                                })?;
+                        validate_redirect(
+                            landing_res.url(),
+                            &redirect_url3,
+                            &[res.url(), jump_res.url(), landing_res.url()],
+                        )?;
+                        Err(ApiError::HttpStatus {
+                            status: landing_res.status(),
+                        })
+                    } else {
+                        Err(ApiError::HttpStatus {
+                            status: landing_res.status(),
+                        })
+                    }
+                }
+                StatusCode::OK => {
+                    let html = jump_res.text().await?;
+                    if sso_login_parser(&html).is_some() {
+                        Ok(SsoSessionStatus::Unauthenticated)
+                    } else {
+                        confirm_cas_authenticated(client, session).await
+                    }
+                }
+                other => Err(ApiError::HttpStatus { status: other }),
+            }
+        }
+        other => Err(ApiError::HttpStatus { status: other }),
+    }
 }

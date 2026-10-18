@@ -28,10 +28,11 @@ pub use pending::{
 };
 
 mod encrypt;
-mod status;
+pub mod status;
+pub(crate) mod tools;
+pub use status::*;
 #[cfg(test)]
 pub(crate) mod tests;
-pub(crate) mod tools;
 
 /// 退出账号登陆
 pub async fn logout(client: &Client, session: &mut Session) -> SSOResult<()> {
