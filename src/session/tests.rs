@@ -471,19 +471,132 @@ fn changed_challenge_cannot_reuse_cipher_without_mainjs() {
 }
 
 #[rstest::rstest]
-fn test_session_set_basearr_rejects_invalid_lengths() {
+#[case("second", 1)]
+#[case("first", 2)]
+fn changed_challenge_invalidates_obsolete_cookie_t(#[case] cd: &str, #[case] nsd: u32) {
     let session = Session::new();
-    assert!(session.set_basearr(&[]).is_err());
-    assert!(session.set_basearr(&[0u8; 15]).is_err());
-    assert!(session.set_basearr(&[0u8; 17]).is_err());
-    assert!(session.set_basearr(&[0u8; 160]).is_ok());
-    assert!(session.set_basearr(&[0u8; 288]).is_ok());
-    assert!(session.set_basearr(&vec![0u8; 4096]).is_ok());
+    assert!(session.set_ruishu_challenge_from_page("$_ts.cd=\"first\";$_ts.nsd=1;"));
+    session
+        .set_ruishu_cookies(
+            "https://sso.cqu.edu.cn/login",
+            "server_cookie_o",
+            "stale_client_cookie_t",
+        )
+        .unwrap();
+    session
+        .set_ruishu_cookies(
+            "https://my.cqu.edu.cn/",
+            "server_cookie_s",
+            "stale_cookie_t",
+        )
+        .unwrap();
+    session
+        .set_cookies("https://example.com/api", "CtLgrmkSWHBZP=foreign_cookie")
+        .unwrap();
+
+    let before = session.cookies(SSO_URL).unwrap().unwrap();
+    assert!(before.contains("CtLgrmkSWHBZO=server_cookie_o"));
+    assert!(before.contains("CtLgrmkSWHBZP=stale_client_cookie_t"));
+
+    assert!(session.set_ruishu_challenge_from_page(&format!("$_ts.cd=\"{cd}\";$_ts.nsd={nsd};")));
+
+    let after = session.cookies(SSO_URL).unwrap().unwrap();
     assert!(
-        session
-            .set_basearr(&vec![0u8; super::ruishu::MAX_BASEARR_LEN + 1])
-            .is_err()
+        after.contains("CtLgrmkSWHBZO=server_cookie_o"),
+        "Cookie O must be preserved across challenge change"
     );
+    assert!(
+        !after.contains("CtLgrmkSWHBZP="),
+        "Stale Cookie T must be purged upon explicit challenge change"
+    );
+    let mycqu = session.cookies("https://my.cqu.edu.cn/").unwrap().unwrap();
+    assert!(mycqu.contains("CtLgrmkSWHBZS=server_cookie_s"));
+    assert!(!mycqu.contains("CtLgrmkSWHBZT="));
+    let foreign = session.cookies("https://example.com/api").unwrap().unwrap();
+    assert!(
+        foreign.contains("CtLgrmkSWHBZP=foreign_cookie"),
+        "Foreign host cookies of the same name must never be purged"
+    );
+}
+
+#[test]
+fn unchanged_or_invalid_challenge_preserves_cookie_t() {
+    let session = Session::new();
+    assert!(session.set_ruishu_challenge_from_page("$_ts.cd=\"first\";$_ts.nsd=1;"));
+    session
+        .set_ruishu_cookies(
+            "https://sso.cqu.edu.cn/login",
+            "server_cookie_o",
+            "client_cookie_t",
+        )
+        .unwrap();
+
+    // 相同挑战
+    assert!(session.set_ruishu_challenge_from_page("$_ts.cd=\"first\";$_ts.nsd=1;"));
+    let cookies = session.cookies(SSO_URL).unwrap().unwrap();
+    assert!(cookies.contains("CtLgrmkSWHBZP=client_cookie_t"));
+
+    // 格式损坏的挑战
+    assert!(!session.set_ruishu_challenge_from_page("$_ts.cd=\"second\";"));
+    let cookies2 = session.cookies(SSO_URL).unwrap().unwrap();
+    assert!(cookies2.contains("CtLgrmkSWHBZP=client_cookie_t"));
+}
+
+#[test]
+fn snapshot_restore_respects_challenge_change_invalidation() {
+    let session = Session::new();
+    assert!(session.set_ruishu_challenge_from_page("$_ts.cd=\"snap_cd\";$_ts.nsd=10;"));
+    session
+        .set_ruishu_cookies("https://sso.cqu.edu.cn/login", "snap_o", "snap_t")
+        .unwrap();
+
+    let snapshot = session.export_snapshot().unwrap();
+    let restored = Session::from_snapshot(&snapshot).unwrap();
+
+    // 恢复后未变更挑战时保留快照中的 Cookie T
+    let cookies = restored.cookies(SSO_URL).unwrap().unwrap();
+    assert!(cookies.contains("CtLgrmkSWHBZO=snap_o"));
+    assert!(cookies.contains("CtLgrmkSWHBZP=snap_t"));
+
+    // 恢复后页面挑战变更，必须淘汰快照中过期的 Cookie T，保留 Cookie O
+    assert!(restored.set_ruishu_challenge_from_page("$_ts.cd=\"rotated_cd\";$_ts.nsd=20;"));
+    let after = restored.cookies(SSO_URL).unwrap().unwrap();
+    assert!(after.contains("CtLgrmkSWHBZO=snap_o"));
+    assert!(!after.contains("CtLgrmkSWHBZP="));
+
+    // 导出并恢复处于"已作废/无Cookie T"状态的会话，恢复后快照同样保持无 T 状态
+    let invalidated_snapshot = restored.export_snapshot().unwrap();
+    let restored_invalidated = Session::from_snapshot(&invalidated_snapshot).unwrap();
+    let re_cookies = restored_invalidated.cookies(SSO_URL).unwrap().unwrap();
+    assert!(re_cookies.contains("CtLgrmkSWHBZO=snap_o"));
+    assert!(!re_cookies.contains("CtLgrmkSWHBZP="));
+}
+
+#[tokio::test]
+async fn execute_protected_refuses_to_send_stale_cookie_t_after_challenge_change() {
+    let session = Session::new();
+    assert!(session.set_ruishu_challenge_from_page("$_ts.cd=\"first\";$_ts.nsd=1;"));
+    session
+        .set_ruishu_cookies(
+            "https://sso.cqu.edu.cn/api/protected/test",
+            "o_val",
+            "stale_t",
+        )
+        .unwrap();
+
+    // 挑战发生变更
+    assert!(session.set_ruishu_challenge_from_page("$_ts.cd=\"second\";$_ts.nsd=2;"));
+
+    // 在无 mainjs 情况下向受保护端点发请求：必须拒绝复用旧 T 发起请求，而应报错
+    let client = reqwest::Client::new();
+    let result = session
+        .execute(client.get("https://sso.cqu.edu.cn/api/protected/probe"))
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(super::SessionError::RuishuError { .. })
+    ));
 }
 
 #[rstest::rstest]
@@ -750,6 +863,22 @@ fn test_snapshot_supports_288_basearr() {
     let snapshot = session.export_snapshot().unwrap();
     let restored = Session::from_snapshot(&snapshot).unwrap();
     assert_eq!(restored.basearr().as_deref(), Some(sample_288.as_slice()));
+}
+
+#[rstest::rstest]
+fn test_session_set_basearr_rejects_invalid_lengths() {
+    let session = Session::new();
+    assert!(session.set_basearr(&[]).is_err());
+    assert!(session.set_basearr(&[0u8; 15]).is_err());
+    assert!(session.set_basearr(&[0u8; 17]).is_err());
+    assert!(session.set_basearr(&[0u8; 160]).is_ok());
+    assert!(session.set_basearr(&[0u8; 288]).is_ok());
+    assert!(session.set_basearr(&vec![0u8; 4096]).is_ok());
+    assert!(
+        session
+            .set_basearr(&vec![0u8; super::ruishu::MAX_BASEARR_LEN + 1])
+            .is_err()
+    );
 }
 
 #[rstest::rstest]

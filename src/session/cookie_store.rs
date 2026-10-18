@@ -81,4 +81,29 @@ impl InternalCookieStore {
         })?;
         Ok(store.iter_unexpired().count())
     }
+
+    /// 移除 CQU 域名（`cqu.edu.cn` 及其子域）下所有路径的指定名称 Cookie
+    pub(crate) fn remove_cqu_cookie(&self, name: &str) -> Result<(), SessionError> {
+        let mut store = self.inner.write().map_err(|_| SessionError::LockError {
+            msg: "cookie store write lock poisoned".to_string(),
+        })?;
+        let to_remove: Vec<(String, String)> = store
+            .iter_any()
+            .filter(|c| c.name() == name)
+            .filter_map(|c| {
+                let domain = c.domain.as_cow()?;
+                let clean_domain = domain.trim_start_matches('.');
+                if clean_domain == "cqu.edu.cn" || clean_domain.ends_with(".cqu.edu.cn") {
+                    let path = c.path.to_string();
+                    Some((domain.into_owned(), path))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (domain, path) in to_remove {
+            store.remove(&domain, &path, name);
+        }
+        Ok(())
+    }
 }

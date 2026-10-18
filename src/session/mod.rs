@@ -83,7 +83,7 @@ impl Session {
 
     /// 使用此会话的上下文（特别是Cookie）来执行一个HTTP请求。
     ///
-    /// 发送前注入 Cookie；受保护请求缺少 Cookie T 且已有挑战时提前纯算；
+    /// 发送前注入 Cookie；受保护请求缺少 Cookie T 且已有挑战材料时提前纯算；
     /// 遇 CQU 瑞数 412 且已有页面挑战时重算 Cookie T 并重发一次。
     /// 无法复制的请求体仍会发送，但不自动重试。
     ///
@@ -105,14 +105,17 @@ impl Session {
 
         loop {
             let mut cookie_header = self.cookie_jar.get_header_value(request.url())?;
+            let (_, cookie_t_name) = ruishu_cookie_names(request.url());
             if is_cqu_host(request.url())
                 && request.url().path().contains("protected")
-                && !cookie_header.as_ref().is_some_and(has_cookie_t)
+                && !cookie_header
+                    .as_ref()
+                    .is_some_and(|h| has_cookie_t(h, cookie_t_name))
                 && !request
                     .headers()
                     .get_all(header::COOKIE)
                     .iter()
-                    .any(has_cookie_t)
+                    .any(|h| has_cookie_t(h, cookie_t_name))
             {
                 self.refresh_ruishu_cookie(request.url())?;
                 cookie_header = self.cookie_jar.get_header_value(request.url())?;
@@ -191,8 +194,9 @@ impl Session {
                 cookie_t
             }
         };
+        let (_, cookie_t_name) = ruishu_cookie_names(url);
         self.cookie_jar
-            .add_cookie_str(&format!("CtLgrmkSWHBZP={cookie_t}; Path=/"), url)?;
+            .add_cookie_str(&format!("{cookie_t_name}={cookie_t}; Path=/"), url)?;
         Ok(true)
     }
 
@@ -210,7 +214,7 @@ impl Session {
         Ok(())
     }
 
-    /// 注入 CQU 瑞数防护 Cookie 对：服务端 Cookie O (`CtLgrmkSWHBZO`) 与客户端 Cookie T (`CtLgrmkSWHBZP`)
+    /// 注入 CQU 瑞数防护 Cookie 对；SSO 使用 O/P，教务网使用 S/T。
     ///
     /// Cookie T 可用 [`ruishu::generate_cookie_t`] 纯算生成。
     pub fn set_ruishu_cookies<U: IntoUrl>(
@@ -219,7 +223,9 @@ impl Session {
         cookie_o: &str,
         cookie_t: &str,
     ) -> Result<(), SessionError> {
-        let cookies = format!("CtLgrmkSWHBZO={cookie_o}; CtLgrmkSWHBZP={cookie_t}");
+        let url = url.into_url()?;
+        let (server_name, client_name) = ruishu_cookie_names(&url);
+        let cookies = format!("{server_name}={cookie_o}; {client_name}={cookie_t}");
         self.set_cookies(url, &cookies)
     }
 
@@ -229,7 +235,6 @@ impl Session {
 
         self.cookie_jar.get_cookie_header(&url)
     }
-
     /// 注入当前挑战的内层密文，用于 412 时重建 Cookie T。
     ///
     /// ```
@@ -325,6 +330,11 @@ impl Session {
                 if let Some((current_cd, current_nsd)) = &state.challenge {
                     if current_cd == cd && *current_nsd == nsd {
                         return true;
+                    }
+                    for name in ["CtLgrmkSWHBZP", "CtLgrmkSWHBZT"] {
+                        if self.cookie_jar.remove_cqu_cookie(name).is_err() {
+                            return false;
+                        }
                     }
                     state.basearr = None;
                 }
@@ -451,13 +461,21 @@ fn extract_ts_cd(html: &str) -> Option<&str> {
     None
 }
 
-fn has_cookie_t(header: &header::HeaderValue) -> bool {
+fn ruishu_cookie_names(url: &reqwest::Url) -> (&'static str, &'static str) {
+    if url.host_str() == Some("my.cqu.edu.cn") {
+        ("CtLgrmkSWHBZS", "CtLgrmkSWHBZT")
+    } else {
+        ("CtLgrmkSWHBZO", "CtLgrmkSWHBZP")
+    }
+}
+
+fn has_cookie_t(header: &header::HeaderValue, cookie_t_name: &str) -> bool {
     header.to_str().is_ok_and(|cookies| {
         cookies.split(';').any(|cookie| {
             cookie
                 .trim()
                 .split_once('=')
-                .is_some_and(|(name, value)| name == "CtLgrmkSWHBZP" && !value.is_empty())
+                .is_some_and(|(name, value)| name == cookie_t_name && !value.is_empty())
         })
     })
 }
