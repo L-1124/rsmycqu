@@ -14,7 +14,7 @@ categories = ["api-bindings"]
 
 [features]
 default = ["sso", "mycqu"]
-sso = ["dep:rsa"]
+sso = []
 mycqu = ["sso"]
 card = ["sso"]
 #library = ["sso"]
@@ -36,8 +36,6 @@ serde_json = { version = "1.0.138" }
 const_format = "0.2.34"
 hex = "0.4.3"
 md-5 = "0.10.6"
-rsa = { version = "0.9", optional = true, features = ["getrandom"] }
-
 [dev-dependencies]
 tokio = { version = "1.43.0", features = ["rt", "macros", "rt-multi-thread"] }
 rstest = "0.26.1"

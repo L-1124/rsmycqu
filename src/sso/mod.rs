@@ -94,16 +94,61 @@ impl SecondFactorKind {
 }
 
 /// 二次身份验证信息
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SecondFactorInfo {
-    /// 手机号
+    /// 手机号（脱敏，用于前端展示）
     pub phone: Option<String>,
-    /// 短信绑定 token
+    /// 短信绑定 token 或完整发送目标
     pub phone_token: Option<String>,
-    /// 邮箱
+    /// 邮箱（发送目标）
     pub email: Option<String>,
     /// 验证流程标识
     pub execution: String,
+}
+
+impl std::fmt::Debug for SecondFactorInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecondFactorInfo")
+            .field("phone", &self.phone)
+            .field("has_phone_token", &self.phone_token.is_some())
+            .field("email", &self.email.as_deref().map(mask_email))
+            .field("has_execution", &(!self.execution.is_empty()))
+            .finish()
+    }
+}
+
+pub(crate) fn mask_email(email: &str) -> String {
+    let email = email.trim();
+    if let Some((user, domain)) = email.split_once('@') {
+        let mut chars = user.chars();
+        match (chars.next(), chars.last()) {
+            (Some(first), Some(last)) => format!("{first}***{last}@{domain}"),
+            (Some(first), None) => format!("{first}***@{domain}"),
+            _ => "***".to_string(),
+        }
+    } else {
+        "***".to_string()
+    }
+}
+
+pub(crate) fn mask_phone(phone: &str) -> String {
+    let phone = phone.trim();
+    if phone.contains('*') {
+        phone.to_string()
+    } else {
+        let char_count = phone.chars().count();
+        if char_count == 11 {
+            let first3: String = phone.chars().take(3).collect();
+            let last4: String = phone.chars().skip(7).collect();
+            format!("{first3}****{last4}")
+        } else if char_count >= 7 {
+            let first3: String = phone.chars().take(3).collect();
+            let last4: String = phone.chars().skip(char_count - 4).collect();
+            format!("{first3}****{last4}")
+        } else {
+            "***".to_string()
+        }
+    }
 }
 
 async fn login_page_result(
@@ -119,20 +164,61 @@ async fn login_page_result(
             || !page.user_email.is_empty());
 
     if is_second_factor {
-        if page.user_object_id.is_empty() {
-            return Err(SSOError::SecondFactorError {
-                msg: "Second-factor page has no user-object-id".to_string(),
+        let has_ssr_phone = !page.phone_number.trim().is_empty();
+        let has_ssr_email = !page.user_email.trim().is_empty();
+        let ssr_phone_is_masked = page.phone_number.contains('*');
+        let ssr_email_is_masked = page.user_email.contains('*');
+
+        let need_phone_lookup = !has_ssr_phone || ssr_phone_is_masked;
+        let need_email_lookup = !has_ssr_email || ssr_email_is_masked;
+
+        let (phone_token, display_phone, email) = if !need_phone_lookup && !need_email_lookup {
+            let display_phone = Some(mask_phone(&page.phone_number));
+            (
+                Some(page.phone_number),
+                display_phone,
+                Some(page.user_email),
+            )
+        } else {
+            if page.user_object_id.is_empty() {
+                return Err(SSOError::SecondFactorError {
+                    msg: "Second-factor page has no user-object-id".to_string(),
+                }
+                .into());
             }
-            .into());
-        }
-        let phone =
-            lookup_binding(client, session, SSO_PHONE_BINDING_URL, &page.user_object_id).await?;
-        let email =
-            lookup_binding(client, session, SSO_MAIL_BINDING_URL, &page.user_object_id).await?;
+
+            let (phone_token, display_phone) = if need_phone_lookup {
+                let phone_resp =
+                    lookup_binding(client, session, SSO_PHONE_BINDING_URL, &page.user_object_id)
+                        .await?;
+                let token = parse_binding(phone_resp.data, SecondFactorKind::Sms)?;
+                let display = if has_ssr_phone {
+                    Some(mask_phone(&page.phone_number))
+                } else {
+                    None
+                };
+                (token, display)
+            } else {
+                let display = Some(mask_phone(&page.phone_number));
+                (Some(page.phone_number), display)
+            };
+
+            let email = if need_email_lookup {
+                let email_resp =
+                    lookup_binding(client, session, SSO_MAIL_BINDING_URL, &page.user_object_id)
+                        .await?;
+                parse_binding(email_resp.data, SecondFactorKind::Mail)?
+            } else {
+                Some(page.user_email)
+            };
+
+            (phone_token, display_phone, email)
+        };
+
         let info = SecondFactorInfo {
-            phone: (!page.phone_number.is_empty()).then_some(page.phone_number),
-            phone_token: parse_binding(phone.data, SecondFactorKind::Sms)?,
-            email: parse_binding(email.data, SecondFactorKind::Mail)?,
+            phone: display_phone,
+            phone_token,
+            email,
             execution: page.login_page_flowkey,
         };
         if info.phone_token.is_none() && info.email.is_none() {
@@ -152,32 +238,16 @@ async fn lookup_binding(
     url: &str,
     user_id: &str,
 ) -> SSOResult<SendCodeResponse> {
-    let (cipher, encrypted_key) = encrypt::BindingCipher::new()?;
     let payload = serde_json::json!({ "userId": user_id });
-    let body = cipher.encrypt(payload.to_string().as_bytes());
-    let res = session
-        .execute(
-            client
-                .post(url)
-                .header("content-type", "application/json")
-                .header("hascrypto", "true")
-                .header("privatekey", encrypted_key)
-                .body(body),
-        )
-        .await?;
-    ensure!(
-        res.status().is_success(),
-        errors::sso::SecondFactorSnafu {
+    let res = session.execute(client.post(url).json(&payload)).await?;
+    if !res.status().is_success() {
+        return Err(SSOError::SecondFactorError {
             msg: format!("Binding lookup returned HTTP {}", res.status()),
         }
-    );
+        .into());
+    }
     let body = res.text().await?;
-    let decoded = if body.trim_start().starts_with('{') {
-        body
-    } else {
-        cipher.decrypt(&body)?
-    };
-    parse_second_factor_response(&decoded, "binding lookup")
+    parse_second_factor_response(&body, "binding lookup")
 }
 
 fn parse_binding(
@@ -191,7 +261,7 @@ fn parse_binding(
         (SecondFactorKind::Mail, Some(value @ Value::String(_))) => Some(value),
         _ => {
             return Err(SSOError::SecondFactorError {
-                msg: format!("Invalid {kind:?} binding response"),
+                msg: format!("Invalid {kind:?} binding response structure"),
             }
             .into());
         }
@@ -203,7 +273,7 @@ fn parse_binding(
             Ok((!value.is_empty()).then(|| value.to_owned()))
         }
         _ => Err(SSOError::SecondFactorError {
-            msg: format!("Invalid {kind:?} binding value"),
+            msg: format!("Invalid {kind:?} binding value type"),
         }
         .into()),
     }

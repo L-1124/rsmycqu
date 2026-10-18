@@ -563,6 +563,169 @@ async fn test_empty_binding_dispatcher_regression_returns_no_second_factor_bindi
         "/api/protected/mail/publicNoToken/findMail"
     );
 }
+#[rstest]
+#[case::both_unmasked(
+    "13800138000",
+    "student@cqu.edu.cn",
+    Some("138****8000"),
+    Some("13800138000"),
+    Some("student@cqu.edu.cn"),
+    0
+)]
+#[case::phone_masked_email_unmasked(
+    "138****8000",
+    "student@cqu.edu.cn",
+    Some("138****8000"),
+    Some("looked-up-phone-token"),
+    Some("student@cqu.edu.cn"),
+    1
+)]
+#[case::phone_unmasked_email_masked(
+    "13800138000",
+    "stu***@cqu.edu.cn",
+    Some("138****8000"),
+    Some("13800138000"),
+    Some("looked-up-email@cqu.edu.cn"),
+    1
+)]
+#[case::both_missing(
+    "",
+    "",
+    None,
+    Some("looked-up-phone-token"),
+    Some("looked-up-email@cqu.edu.cn"),
+    2
+)]
+#[tokio::test]
+async fn test_login_page_result_prefers_unmasked_ssr_contacts_without_directory_id(
+    #[case] ssr_phone: &str,
+    #[case] ssr_email: &str,
+    #[case] expected_phone_display: Option<&str>,
+    #[case] expected_phone_token: Option<&str>,
+    #[case] expected_email: Option<&str>,
+    #[case] expected_lookups: usize,
+) {
+    let session = Session::new();
+    let s = &session;
+    let mut replies = Vec::new();
+    if ssr_phone.is_empty() || ssr_phone.contains('*') {
+        replies.push(http_reply(
+            "200 OK",
+            r#"{"code":200,"data":{"tel":"looked-up-phone-token"}}"#,
+        ));
+    }
+    if ssr_email.is_empty() || ssr_email.contains('*') {
+        replies.push(http_reply(
+            "200 OK",
+            r#"{"code":200,"data":"looked-up-email@cqu.edu.cn"}"#,
+        ));
+    }
+
+    let user_obj_id = if expected_lookups > 0 {
+        "user-mongo-id-123".to_string()
+    } else {
+        String::new()
+    };
+
+    let page = SSOLoginPageData {
+        login_croypto: "crypto".into(),
+        login_page_flowkey: "flowkey-ssr-test".into(),
+        captcha_url: String::new(),
+        captcha_payload: String::new(),
+        sso_second: "smsLogin".into(),
+        phone_number: ssr_phone.to_string(),
+        user_email: ssr_email.to_string(),
+        current_login_type: "smsLogin".into(),
+        user_object_id: user_obj_id,
+    };
+
+    let (result, requests) = run_test_tls_server(replies, |client| async move {
+        super::login_page_result(&client, s, page).await
+    })
+    .await;
+
+    let outcome = result.expect("outcome should succeed");
+    let super::LoginResult::SecondFactorRequired(info) = outcome else {
+        panic!("expected SecondFactorRequired, got {outcome:?}");
+    };
+
+    assert_eq!(info.phone.as_deref(), expected_phone_display);
+    assert_eq!(info.phone_token.as_deref(), expected_phone_token);
+    assert_eq!(info.email.as_deref(), expected_email);
+    assert_eq!(requests.len(), expected_lookups);
+
+    // Secrecy invariants: neither Debug representation leaks unmasked raw contact
+    let debug_str = format!("{info:?}");
+    assert!(!debug_str.contains("13800138000"));
+    if let Some(token) = expected_phone_token {
+        assert!(!debug_str.contains(token));
+    }
+    assert!(!debug_str.contains("student@cqu.edu.cn"));
+    assert!(!debug_str.contains("looked-up-email@cqu.edu.cn"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_login_page_result_lookup_http_500_propagates_honest_error() {
+    let session = Session::new();
+    let s = &session;
+    let replies = vec![http_reply("500 Internal Server Error", "server error")];
+    let page = SSOLoginPageData {
+        login_croypto: "crypto".into(),
+        login_page_flowkey: "flowkey-error".into(),
+        captcha_url: String::new(),
+        captcha_payload: String::new(),
+        sso_second: "smsLogin".into(),
+        phone_number: String::new(),
+        user_email: String::new(),
+        current_login_type: "smsLogin".into(),
+        user_object_id: "user-123".into(),
+    };
+
+    let (result, requests) = run_test_tls_server(replies, |client| async move {
+        super::login_page_result(&client, s, page).await
+    })
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(ApiError::Inner {
+            source: SSOError::SecondFactorError { .. }
+        })
+    ));
+    assert_eq!(requests.len(), 1);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_login_page_result_masked_contact_missing_object_id_fails_explicitly() {
+    let session = Session::new();
+    let s = &session;
+    let page = SSOLoginPageData {
+        login_croypto: "crypto".into(),
+        login_page_flowkey: "flowkey-no-id".into(),
+        captcha_url: String::new(),
+        captcha_payload: String::new(),
+        sso_second: "smsLogin".into(),
+        phone_number: "138****1234".into(),
+        user_email: String::new(),
+        current_login_type: "smsLogin".into(),
+        user_object_id: String::new(),
+    };
+
+    let (result, requests) = run_test_tls_server(vec![], |client| async move {
+        super::login_page_result(&client, s, page).await
+    })
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(ApiError::Inner {
+            source: SSOError::SecondFactorError { .. }
+        })
+    ));
+    assert!(requests.is_empty());
+}
 
 #[tokio::test]
 async fn test_send_second_factor_code_sms_success_and_request_serialization() {
