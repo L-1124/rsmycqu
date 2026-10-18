@@ -15,7 +15,10 @@ pub struct Course {
     #[serde(default)]
     pub name: Option<String>,
     /// 课程代码
-    #[serde_as(deserialize_as = "serde_with::FromInto<CourseCodeField>")]
+    #[serde_as(
+        deserialize_as = "serde_with::FromInto<CourseCodeField>",
+        serialize_as = "serde_with::FromInto<CourseCodeField>"
+    )]
     #[serde(flatten)]
     pub code: Option<String>,
     /// 教学班号，在无法获取时（如考表[`exam::Exam`]中）设为 [`None`]
@@ -23,7 +26,10 @@ pub struct Course {
     #[serde(default)]
     pub course_num: Option<String>,
     /// 开课学院， 在无法获取时（如成绩[`score::Score`]中）设为[`None`]
-    #[serde_as(deserialize_as = "serde_with::FromInto<DepartmentField>")]
+    #[serde_as(
+        deserialize_as = "serde_with::FromInto<DepartmentField>",
+        serialize_as = "serde_with::FromInto<DepartmentField>"
+    )]
     #[serde(flatten)]
     pub dept: Option<String>,
     /// 学分，无法获取到（如在考表[`exam::Exam`]中）则为[`None`]
@@ -32,7 +38,10 @@ pub struct Course {
     #[serde(default)]
     pub credit: Option<f64>,
     /// 教师
-    #[serde_as(deserialize_as = "serde_with::FromInto<InstructorField>")]
+    #[serde_as(
+        deserialize_as = "serde_with::FromInto<InstructorField>",
+        serialize_as = "serde_with::FromInto<InstructorField>"
+    )]
     #[serde(flatten)]
     pub instructor: Option<String>,
     /// 学期，无法获取时则为[`None`]

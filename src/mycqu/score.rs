@@ -31,7 +31,10 @@ pub struct Score {
     #[serde(flatten)]
     pub course: Course,
     /// 成绩，可能为数字，也可能为字符（优、良等）
-    #[serde_as(deserialize_as = "serde_with::FromInto<ScoreField>")]
+    #[serde_as(
+        deserialize_as = "serde_with::FromInto<ScoreField>",
+        serialize_as = "serde_with::FromInto<ScoreField>"
+    )]
     #[serde(flatten)]
     pub score: Option<String>,
     /// 初修/重修
