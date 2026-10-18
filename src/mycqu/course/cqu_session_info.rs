@@ -121,9 +121,12 @@ impl CQUSessionInfo {
             client.get(MYCQU_API_ALL_SESSION_INFO_URL)
         })
         .await?;
-        let (mut res, raw_response) = response_json_map(response).await?;
+        let mut res = response_json_map(response).await?;
+        if res.contains_key("status") {
+            crate::mycqu::utils::check_website_response(&res)?;
+        }
 
-        Self::extract_array(&mut res, "sessionVOList", &raw_response)
+        Self::extract_array(&mut res, "sessionVOList")
     }
 
     /// 通过具有教务网权限的会话([`Session`])，从教务网获取包括了ID的当前学期详细信息([`CQUSessionInfo`])
@@ -149,9 +152,12 @@ impl CQUSessionInfo {
             client.get(MYCQU_API_CURR_SESSION_INFO_URL)
         })
         .await?;
-        let (mut res, raw_response) = response_json_map(response).await?;
+        let mut res = response_json_map(response).await?;
+        if res.contains_key("status") {
+            crate::mycqu::utils::check_website_response(&res)?;
+        }
 
-        Self::extract_object(&mut res, "data", &raw_response)
+        Self::extract_object(&mut res, "data")
     }
 
     /// 通过具有教务网权限的会话([`Session`])，从教务网查询某一学期ID对应的学期具体信息([`CQUSessionInfo`])
@@ -181,9 +187,12 @@ impl CQUSessionInfo {
             ))
         })
         .await?;
-        let (mut res, raw_response) = response_json_map(response).await?;
+        let mut res = response_json_map(response).await?;
+        if res.contains_key("status") {
+            crate::mycqu::utils::check_website_response(&res)?;
+        }
 
-        Self::extract_object(&mut res, "data", &raw_response)
+        Self::extract_object(&mut res, "data")
     }
 }
 

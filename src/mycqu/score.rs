@@ -86,7 +86,7 @@ impl Score {
                 .query(&[("isMinorBoo", is_minor)])
         })
         .await?;
-        let (mut res, raw_response) = response_json_map(response).await?;
+        let mut res = response_json_map(response).await?;
 
         check_website_response(&res)?;
 
@@ -94,7 +94,6 @@ impl Score {
             .and_then(Value::as_object_mut)
             .ok_or_else(|| errors::ApiError::ModelParse {
                 msg: "Excepted field \"data\" is missing or not an object".to_string(),
-                raw_response: raw_response.clone(),
             })?
             .values_mut()
             .map(|obj| {
@@ -102,9 +101,8 @@ impl Score {
                     .and_then(Value::as_array_mut)
                     .ok_or_else(|| errors::ApiError::ModelParse {
                         msg: "Failed to parse score list".to_string(),
-                        raw_response: raw_response.clone(),
                     })
-                    .and_then(|array| ApiModel::parse_json_array(array, &raw_response))
+                    .and_then(ApiModel::parse_json_array)
             })
             .try_fold(Vec::<Self>::new(), |mut acc, item| {
                 acc.extend(item?);
@@ -176,10 +174,10 @@ impl GPARanking {
                 .query(&[("isMinorBoo", false)])
         })
         .await?;
-        let (mut res, raw_response) = response_json_map(response).await?;
+        let mut res = response_json_map(response).await?;
         check_website_response(&res)?;
 
-        Self::extract_object(&mut res, "data", &raw_response)
+        Self::extract_object(&mut res, "data")
     }
 }
 

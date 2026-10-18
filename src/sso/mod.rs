@@ -26,7 +26,7 @@ mod encrypt;
 mod tools;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// 退出账号登陆
 pub async fn logout(client: &Client, session: &mut Session) -> SSOResult<()> {
@@ -45,15 +45,13 @@ pub async fn captcha_image(client: &Client, session: &Session) -> SSOResult<Vec<
     let status = res.status();
     let bytes = res.bytes().await?.to_vec();
 
-    if status != StatusCode::OK || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        return Err(SSOError::UnknownSSOError {
-            msg: format!(
-                "captcha endpoint returned status {} with {} bytes (expected PNG image)",
-                status,
-                bytes.len()
-            ),
-        }
-        .into());
+    if !status.is_success() {
+        return Err(ApiError::HttpStatus { status });
+    }
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err(ApiError::ModelParse {
+            msg: "Captcha response is not a valid PNG image".to_string(),
+        });
     }
 
     Ok(bytes)
@@ -241,10 +239,9 @@ async fn lookup_binding(
     let payload = serde_json::json!({ "userId": user_id });
     let res = session.execute(client.post(url).json(&payload)).await?;
     if !res.status().is_success() {
-        return Err(SSOError::SecondFactorError {
-            msg: format!("Binding lookup returned HTTP {}", res.status()),
-        }
-        .into());
+        return Err(ApiError::HttpStatus {
+            status: res.status(),
+        });
     }
     let body = res.text().await?;
     parse_second_factor_response(&body, "binding lookup")
@@ -260,10 +257,9 @@ fn parse_binding(
         (SecondFactorKind::Sms, Some(Value::Object(mut data))) => data.remove("tel"),
         (SecondFactorKind::Mail, Some(value @ Value::String(_))) => Some(value),
         _ => {
-            return Err(SSOError::SecondFactorError {
+            return Err(ApiError::ModelParse {
                 msg: format!("Invalid {kind:?} binding response structure"),
-            }
-            .into());
+            });
         }
     };
     match value {
@@ -272,10 +268,9 @@ fn parse_binding(
             let value = value.trim();
             Ok((!value.is_empty()).then(|| value.to_owned()))
         }
-        _ => Err(SSOError::SecondFactorError {
+        _ => Err(ApiError::ModelParse {
             msg: format!("Invalid {kind:?} binding value type"),
-        }
-        .into()),
+        }),
     }
 }
 
@@ -471,10 +466,9 @@ async fn handle_send_code_response(res: Response, method: &str) -> SSOResult<()>
 }
 
 fn parse_second_factor_response(body: &str, method: &str) -> SSOResult<SendCodeResponse> {
-    let resp: SendCodeResponse =
-        serde_json::from_str(body).map_err(|err| SSOError::SecondFactorError {
-            msg: format!("{method} returned an invalid JSON response: {err}"),
-        })?;
+    let resp: SendCodeResponse = serde_json::from_str(body).map_err(|_| ApiError::ModelParse {
+        msg: format!("{method} returned an invalid JSON response"),
+    })?;
     if resp.code != Some(200) {
         let err_msg = resp
             .data

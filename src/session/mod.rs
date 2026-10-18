@@ -69,7 +69,9 @@ impl Session {
         builder: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, SessionError> {
         let (client, request) = builder.build_split();
-        let mut request = request?;
+        let mut request = request.map_err(|e| SessionError::Build {
+            source: e.without_url(),
+        })?;
         let mut retry_request = if is_cqu_host(request.url()) {
             request.try_clone()
         } else {
@@ -106,7 +108,12 @@ impl Session {
                     request.headers_mut().insert(CSRF_VALUE_HEADER, value);
                 }
             }
-            let response = client.execute(request).await?;
+            let response = client
+                .execute(request)
+                .await
+                .map_err(|e| SessionError::Build {
+                    source: e.without_url(),
+                })?;
             let response_url = response.url();
             for cookie_str in response
                 .headers()

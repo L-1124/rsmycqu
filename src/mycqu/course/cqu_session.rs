@@ -113,7 +113,6 @@ impl FromStr for CQUSession {
             })
             .ok_or_else(|| ApiError::ModelParse {
                 msg: "CQUSession parse error".to_string(),
-                raw_response: s.to_string(),
             })
     }
 }

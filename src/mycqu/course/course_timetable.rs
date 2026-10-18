@@ -96,9 +96,12 @@ impl CourseTimetable {
                 .json(&vec![student_id.as_ref()])
         })
         .await?;
-        let (mut res, raw_response) = response_json_map(response).await?;
+        let mut res = response_json_map(response).await?;
+        if res.contains_key("status") {
+            crate::mycqu::utils::check_website_response(&res)?;
+        }
 
-        Self::extract_array(&mut res, "classTimetableVOList", &raw_response)
+        Self::extract_array(&mut res, "classTimetableVOList")
     }
 
     /// 通过具有教务网权限的会话([`Session`])，获取用户已选课程的课表([`Vec<CourseTimetable>`])
@@ -133,9 +136,12 @@ impl CourseTimetable {
             ))
         })
         .await?;
-        let (mut res, raw_response) = response_json_map(response).await?;
+        let mut res = response_json_map(response).await?;
+        if res.contains_key("status") {
+            crate::mycqu::utils::check_website_response(&res)?;
+        }
 
-        Self::extract_array(&mut res, "data", &raw_response)
+        Self::extract_array(&mut res, "data")
     }
 }
 

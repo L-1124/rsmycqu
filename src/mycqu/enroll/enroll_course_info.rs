@@ -78,7 +78,7 @@ impl EnrollCourseInfo {
                 .query(&[("selectionSource", if is_major { "主修" } else { "辅修" })])
         })
         .await?;
-        let (mut res, raw_response) = response_json_map(response).await?;
+        let mut res = response_json_map(response).await?;
         check_website_response(&res)?;
 
         let arrays = res
@@ -86,23 +86,29 @@ impl EnrollCourseInfo {
             .and_then(Value::as_array_mut)
             .ok_or_else(|| ApiError::ModelParse {
                 msg: "Excepted field \"data\" is missing or not an array".to_string(),
-                raw_response: raw_response.clone(),
             })?;
 
         arrays
             .iter_mut()
-            .filter_map(Value::as_object_mut)
-            .filter_map(|item| {
-                let key = item
+            .map(|item| {
+                let obj = item.as_object_mut().ok_or_else(|| ApiError::ModelParse {
+                    msg: "Expected selection area item to be an object".to_string(),
+                })?;
+                let key = obj
                     .get("selectionArea")
                     .and_then(Value::as_str)
-                    .map(ToString::to_string);
-                let value = item.get_mut("courseVOList").and_then(Value::as_array_mut);
-                key.zip(value)
-            })
-            .map(|(key, value)| {
-                EnrollCourseInfo::parse_json_array::<MyCQUError>(value, &raw_response)
-                    .map(|courses| (key, courses))
+                    .ok_or_else(|| ApiError::ModelParse {
+                        msg: "Missing selectionArea field in enrollment course info".to_string(),
+                    })?
+                    .to_string();
+                let value = obj
+                    .get_mut("courseVOList")
+                    .and_then(Value::as_array_mut)
+                    .ok_or_else(|| ApiError::ModelParse {
+                        msg: "Missing courseVOList array in enrollment course info".to_string(),
+                    })?;
+                let courses = EnrollCourseInfo::parse_json_array::<MyCQUError>(value)?;
+                Ok((key, courses))
             })
             .collect::<MyCQUResult<HashMap<_, _>>>()
     }

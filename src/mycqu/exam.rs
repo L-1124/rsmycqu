@@ -126,9 +126,12 @@ impl Exam {
                 .query(&[("studentId", encrypt_student_id(student_id))])
         })
         .await?;
-        let (mut res, raw_response) = response_json_map(response).await?;
+        let mut res = response_json_map(response).await?;
+        if res.contains_key("status") {
+            crate::mycqu::utils::check_website_response(&res)?;
+        }
 
-        Self::extract_array(&mut res, "data", &raw_response)
+        Self::extract_array(&mut res, "data")
     }
 }
 

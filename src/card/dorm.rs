@@ -1,8 +1,5 @@
 //! 宿舍水电费相关API
-use reqwest::{
-    StatusCode,
-    header::{COOKIE, HeaderValue},
-};
+use reqwest::{StatusCode, header::COOKIE};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use snafu::ensure;
@@ -171,22 +168,19 @@ impl EnergyFees {
             .synjones_auth
             .as_ref()
             .unwrap();
-        let cookie_header = HeaderValue::from_str(&format!("synjones-auth={}", synjones_auth))
-            .map_err(|err| ApiError::Website {
-                msg: format!("Set cookies error: {}", err),
-            })?;
+        let cookie_value = format!("synjones-auth={}", synjones_auth);
 
         let res = card_request_handler(client, session, |client| {
             client
                 .post(CARD_GET_DORM_FEE_URL)
                 .form(&[
-                    ("feeitemid", if is_huxi { "182" } else { "181" }), // 虎溪校区该项为'182'，老校区为'181'
+                    ("feeitemid", if is_huxi { "182" } else { "181" }),
                     ("json", "true"),
                     ("level", "2"),
                     ("room", room.as_ref()),
                     ("type", "IEC"),
                 ])
-                .header(COOKIE, cookie_header)
+                .header(COOKIE, cookie_value)
         })
         .await?;
 
@@ -197,18 +191,18 @@ impl EnergyFees {
             }
         );
 
-        let (mut json, raw_response) = response_json_map(res).await?;
+        let mut json = response_json_map(res).await?;
 
         let msg = json
             .get("msg")
             .and_then(|item| item.as_str())
-            .ok_or(ApiError::Website {
-                msg: "Website response format incorrect".to_string(),
+            .ok_or(ApiError::ModelParse {
+                msg: "Website response format incorrect: missing msg".to_string(),
             })?;
         ensure!(
             msg == "success",
             errors::WebsiteSnafu {
-                msg: "Website response format incorrect".to_string()
+                msg: "Get Dorm Fee Error".to_string(),
             }
         );
 
@@ -216,12 +210,11 @@ impl EnergyFees {
             .and_then(|item| item.get_mut("showData"))
             .map(Value::take)
             .map(serde_json::from_value)
-            .ok_or(ApiError::Website {
-                msg: "Website response format incorrect".to_string(),
+            .ok_or(ApiError::ModelParse {
+                msg: "Website response format incorrect: missing showData".to_string(),
             })?
             .map_err(|_| ApiError::ModelParse {
-                msg: "Website response format incorrect".to_string(),
-                raw_response,
+                msg: "Failed to deserialize EnergyFees model".to_string(),
             })
     }
 }

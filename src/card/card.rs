@@ -2,13 +2,11 @@
 
 use reqwest::header::CONTENT_LENGTH;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, from_str};
+use serde_json::Value;
 use serde_with::serde_as;
-use snafu::ensure;
 
 use crate::{
-    card::utils::card_request_handler,
-    errors,
+    card::utils::{card_request_handler, parse_card_envelope},
     errors::{ApiError, card::CardResult},
     session::{Client, Session},
     utils::{
@@ -87,23 +85,8 @@ impl Card {
         })
         .await?;
 
-        let text = res.json::<String>().await?;
-        let raw_response = text.clone();
-        let mut json = from_str::<Map<String, Value>>(&text).map_err(|_| ApiError::Website {
-            msg: "Website response format incorrect".to_string(),
-        })?;
-
-        ensure!(
-            json.get("respCode").and_then(Value::as_str) == Some("0000"),
-            errors::WebsiteSnafu {
-                msg: json
-                    .get("respInfo")
-                    .and_then(Value::as_str)
-                    .unwrap_or("No Website Error")
-                    .to_string(),
-            }
-        );
-
+        let text = res.text().await?;
+        let mut json = parse_card_envelope(&text)?;
         if let Some(Value::Array(mut data)) = json.get_mut("objs").map(Value::take) {
             fn card_type_name(value: &Value) -> Option<&str> {
                 value.get("cardTypeName").and_then(Value::as_str)
@@ -130,13 +113,12 @@ impl Card {
                 })?;
             let card = data.remove(card_index);
 
-            serde_json::from_value(card).map_err(|err| ApiError::ModelParse {
-                msg: format!("Deserialize error: {}", err),
-                raw_response,
+            serde_json::from_value(card).map_err(|_| ApiError::ModelParse {
+                msg: "Failed to deserialize Card model".to_string(),
             })
         } else {
-            Err(ApiError::Website {
-                msg: "Website response format incorrect".to_string(),
+            Err(ApiError::ModelParse {
+                msg: "Website response format incorrect: missing objs array".to_string(),
             })
         }
     }
@@ -183,19 +165,24 @@ impl Card {
         })
         .await?;
 
-        let (mut json, raw_response) = response_json_map(res).await?;
+        let mut json = response_json_map(res).await?;
+
+        if let Some(resp_code) = json.get("respCode").and_then(Value::as_str) && resp_code != "0000" {
+            return Err(ApiError::Website {
+                msg: "Card bill query returned non-zero response code".to_string(),
+            });
+        }
 
         if let Some(Value::Array(data)) = json.get_mut("rows").map(Value::take) {
             data.into_iter()
                 .map(serde_json::from_value)
                 .collect::<Result<_, serde_json::Error>>()
-                .map_err(|err| ApiError::ModelParse {
-                    msg: format!("Deserialize error: {}", err),
-                    raw_response,
+                .map_err(|_| ApiError::ModelParse {
+                    msg: "Failed to deserialize Bill model".to_string(),
                 })
         } else {
-            Err(ApiError::Website {
-                msg: "Website response format incorrect".to_string(),
+            Err(ApiError::ModelParse {
+                msg: "Website response format incorrect: missing rows array".to_string(),
             })
         }
     }

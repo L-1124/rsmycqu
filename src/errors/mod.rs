@@ -29,7 +29,18 @@ mod sealed {
 
     #[cfg(feature = "card")]
     impl Sealed for crate::errors::card::CardError {}
+
+    #[cfg(test)]
+    impl Sealed for super::DummyTestError {}
 }
+
+#[cfg(test)]
+#[derive(Debug, snafu::Snafu)]
+#[snafu(display("dummy test error"))]
+pub(crate) struct DummyTestError;
+
+#[cfg(test)]
+impl RsMyCQUError for DummyTestError {}
 
 /// RsMyCQUError
 pub trait RsMyCQUError: std::error::Error + 'static + Sealed {}
@@ -60,13 +71,18 @@ pub enum ApiError<T: RsMyCQUError> {
         source: reqwest::Error,
     },
 
+    /// 当请求返回未预期的 HTTP 状态码时抛出
+    #[snafu(display("Unexpected HTTP status: {status}"))]
+    HttpStatus {
+        /// HTTP 状态码
+        status: reqwest::StatusCode,
+    },
+
     /// 数据模型解析异常时抛出
-    #[snafu(display("Model Parse Error: {msg}; Raw Response: {raw_response}"))]
+    #[snafu(display("Model Parse Error: {msg}"))]
     ModelParse {
         /// 错误信息
         msg: String,
-        /// 原始请求响应
-        raw_response: String,
     },
 
     /// 当请求网站出现异常时抛出
@@ -101,19 +117,76 @@ impl<T: RsMyCQUError> ApiError<T> {
             msg: "Expected response has \"Location\" but not found".to_string(),
         }
     }
+
+    /// 检查是否为网络超时错误
+    pub fn is_timeout(&self) -> bool {
+        match self {
+            ApiError::Request { source } => source.is_timeout(),
+            _ => false,
+        }
+    }
+
+    /// 检查是否为网络连接或传输错误（排除超时、解析、重定向、请求构造或状态码错误）
+    pub fn is_network(&self) -> bool {
+        match self {
+            ApiError::Request { source } => {
+                !source.is_timeout()
+                    && !source.is_decode()
+                    && !source.is_builder()
+                    && !source.is_redirect()
+                    && !source.is_status()
+                    && (source.is_connect() || source.is_request() || source.is_body())
+            }
+            _ => false,
+        }
+    }
+
+    /// 检查是否为数据模型解析或解码错误
+    pub fn is_model_parse(&self) -> bool {
+        matches!(self, ApiError::ModelParse { .. })
+    }
+
+    /// 检查是否为认证或权限失效错误
+    pub fn is_auth_error(&self) -> bool {
+        matches!(self, ApiError::NotLogin | ApiError::NotAccess)
+    }
+
+    /// 获取关联的 HTTP 状态码（若存在）
+    pub fn status_code(&self) -> Option<reqwest::StatusCode> {
+        match self {
+            ApiError::HttpStatus { status } => Some(*status),
+            ApiError::Request { source } => source.status(),
+            _ => None,
+        }
+    }
 }
 
 impl<T: RsMyCQUError> From<reqwest::Error> for ApiError<T> {
     fn from(source: reqwest::Error) -> Self {
-        ApiError::Request { source }
+        let sanitized = source.without_url();
+        if sanitized.is_timeout() {
+            ApiError::Request { source: sanitized }
+        } else if sanitized.is_decode() {
+            ApiError::ModelParse {
+                msg: "Response body failed to deserialize into expected model".to_string(),
+            }
+        } else {
+            ApiError::Request { source: sanitized }
+        }
     }
 }
 
 impl<T: RsMyCQUError> From<session::SessionError> for ApiError<T> {
     fn from(source: session::SessionError) -> Self {
-        ApiError::Session { source }
+        match source {
+            session::SessionError::Build { source: req_err } => ApiError::from(req_err),
+            other => ApiError::Session { source: other },
+        }
     }
 }
 
 /// API返回结果
 pub type ApiResult<T, E> = Result<T, ApiError<E>>;
+
+#[cfg(test)]
+mod tests;

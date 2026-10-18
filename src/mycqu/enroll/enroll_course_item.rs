@@ -99,7 +99,10 @@ impl EnrollCourseItem {
                 .query(&[("selectionSource", if is_major { "主修" } else { "辅修" })])
         })
         .await?;
-        let (mut res, raw_response) = response_json_map(response).await?;
+        let mut res = response_json_map(response).await?;
+        if res.contains_key("status") {
+            crate::mycqu::utils::check_website_response(&res)?;
+        }
 
         let select_course = res
             .get_mut("selectCourseListVOs")
@@ -107,18 +110,16 @@ impl EnrollCourseItem {
             .ok_or_else(|| ApiError::ModelParse {
                 msg: "Excepted field \"selectCourseListVOs\" is missing or not an array"
                     .to_string(),
-                raw_response: raw_response.clone(),
             })?;
 
         if !select_course.is_empty() {
             select_course[0]
                 .get_mut("selectCourseVOList")
                 .and_then(Value::as_array_mut)
-                .map(|array| EnrollCourseItem::parse_json_array(array, &raw_response))
+                .map(EnrollCourseItem::parse_json_array)
                 .ok_or_else(|| ApiError::ModelParse {
                     msg: "Excepted field \"selectCourseVOList\" is missing or not an array"
                         .to_string(),
-                    raw_response,
                 })?
         } else {
             Ok(Vec::new())

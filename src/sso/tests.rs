@@ -151,21 +151,26 @@ fn serve_http(replies: Vec<String>) -> (String, std::thread::JoinHandle<()>) {
     (url, server)
 }
 
-fn http_reply(status: &str, body: &str) -> String {
+pub(crate) fn http_reply(status: &str, body: &str) -> String {
     format!(
         "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
 }
 
-fn http_redirect(location: &str) -> String {
+pub(crate) fn http_redirect(location: &str) -> String {
     format!(
         "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     )
 }
 
 fn create_test_tls_acceptor() -> (TlsAcceptor, reqwest::tls::Certificate) {
-    let subject_alt_names = vec!["sso.cqu.edu.cn".to_string(), "localhost".to_string()];
+    let subject_alt_names = vec![
+        "sso.cqu.edu.cn".to_string(),
+        "my.cqu.edu.cn".to_string(),
+        "card.cqu.edu.cn".to_string(),
+        "localhost".to_string(),
+    ];
     let cert_key =
         rcgen::generate_simple_self_signed(subject_alt_names).expect("generate self-signed cert");
 
@@ -187,15 +192,15 @@ fn create_test_tls_acceptor() -> (TlsAcceptor, reqwest::tls::Certificate) {
 }
 
 #[derive(Debug, Clone)]
-struct RecordedRequest {
-    method: String,
-    path: String,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
+pub(crate) struct RecordedRequest {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: Vec<u8>,
 }
 
 impl RecordedRequest {
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
@@ -203,8 +208,23 @@ impl RecordedRequest {
     }
 }
 
-async fn run_test_tls_server<F, Fut, T>(
+pub(crate) async fn run_test_tls_server<F, Fut, T>(
     replies: Vec<String>,
+    test_fn: F,
+) -> (T, Vec<RecordedRequest>)
+where
+    F: FnOnce(Client) -> Fut,
+    Fut: Future<Output = T>,
+{
+    run_test_tls_server_raw(
+        replies.into_iter().map(String::into_bytes).collect(),
+        test_fn,
+    )
+    .await
+}
+
+pub(crate) async fn run_test_tls_server_raw<F, Fut, T>(
+    replies: Vec<Vec<u8>>,
     test_fn: F,
 ) -> (T, Vec<RecordedRequest>)
 where
@@ -286,7 +306,7 @@ where
                 body,
             });
 
-            let _ = tls_stream.write_all(reply.as_bytes()).await;
+            let _ = tls_stream.write_all(&reply).await;
             let _ = tls_stream.flush().await;
             let _ = tls_stream.shutdown().await;
         }
@@ -297,6 +317,8 @@ where
             .no_proxy()
             .add_root_certificate(root_cert)
             .resolve("sso.cqu.edu.cn", addr)
+            .resolve("my.cqu.edu.cn", addr)
+            .resolve("card.cqu.edu.cn", addr)
     })
     .expect("custom Client for TLS loopback tests");
 
@@ -306,6 +328,109 @@ where
         .await
         .expect("server task did not complete within timeout")
         .expect("server task panicked");
+
+    let requests = recorded_requests.lock().await.clone();
+    (output, requests)
+}
+
+pub(crate) async fn run_test_http_server<F, Fut, T>(
+    replies: Vec<String>,
+    test_fn: F,
+) -> (T, Vec<RecordedRequest>)
+where
+    F: FnOnce(Client) -> Fut,
+    Fut: Future<Output = T>,
+{
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test http listener");
+    let addr = listener.local_addr().expect("listener address");
+
+    let recorded_requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let requests_clone = Arc::clone(&recorded_requests);
+
+    let server_task = tokio::spawn(async move {
+        for reply in replies {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(_) => break,
+            };
+
+            let mut buffer = [0u8; 1024];
+            let mut raw = Vec::new();
+            let header_end = loop {
+                let count = match stream.read(&mut buffer).await {
+                    Ok(c) if c > 0 => c,
+                    _ => break None,
+                };
+                raw.extend_from_slice(&buffer[..count]);
+                if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break Some(pos);
+                }
+            };
+
+            let Some(pos) = header_end else {
+                continue;
+            };
+
+            let header_text = String::from_utf8_lossy(&raw[..pos]);
+            let mut lines = header_text.lines();
+            let request_line = lines.next().unwrap_or_default();
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or("GET").to_string();
+            let path = parts.next().unwrap_or("/").to_string();
+
+            let mut headers = Vec::new();
+            let mut content_length = 0usize;
+            for line in lines {
+                if let Some((name, val)) = line.split_once(':') {
+                    let name = name.trim();
+                    let val = val.trim();
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length = val.parse().unwrap_or(0);
+                    }
+                    headers.push((name.to_string(), val.to_string()));
+                }
+            }
+
+            let body_start = pos + 4;
+            let mut body = raw[body_start..].to_vec();
+            while body.len() < content_length {
+                let count = match stream.read(&mut buffer).await {
+                    Ok(c) if c > 0 => c,
+                    _ => break,
+                };
+                body.extend_from_slice(&buffer[..count]);
+            }
+
+            requests_clone.lock().await.push(RecordedRequest {
+                method,
+                path,
+                headers,
+                body,
+            });
+
+            let _ = stream.write_all(reply.as_bytes()).await;
+            let _ = stream.flush().await;
+            let _ = stream.shutdown().await;
+        }
+    });
+
+    let client = Client::custom(|builder| {
+        builder
+            .no_proxy()
+            .resolve("card.cqu.edu.cn", addr)
+            .resolve("sso.cqu.edu.cn", addr)
+            .resolve("my.cqu.edu.cn", addr)
+    })
+    .expect("custom Client for HTTP loopback tests");
+
+    let output = test_fn(client).await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), server_task)
+        .await
+        .expect("http server task did not complete within timeout")
+        .expect("http server task panicked");
 
     let requests = recorded_requests.lock().await.clone();
     (output, requests)
@@ -689,8 +814,8 @@ async fn test_login_page_result_lookup_http_500_propagates_honest_error() {
 
     assert!(matches!(
         result,
-        Err(ApiError::Inner {
-            source: SSOError::SecondFactorError { .. }
+        Err(ApiError::HttpStatus {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR
         })
     ));
     assert_eq!(requests.len(), 1);
