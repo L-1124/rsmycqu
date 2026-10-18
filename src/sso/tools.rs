@@ -1,12 +1,11 @@
 use reqwest::{Response, StatusCode};
+use snafu::ensure;
 
 use crate::{
-    errors::{
-        ApiError,
-        sso::{SSOError, SSOResult},
-    },
+    errors,
+    errors::{ApiError, sso::SSOResult},
     session::{Client, Session},
-    sso::{encrypt::encrypt_password, logout},
+    sso::{encrypt::encrypt_password, logout, status},
     utils::{
         consts::SSO_LOGIN_URL,
         get_response_header,
@@ -14,31 +13,28 @@ use crate::{
     },
 };
 
-/// 登陆页面返回数据，根据该数据确定是否需要验证码或登陆链接
-pub(super) enum LoginPageResponse {
-    HasLogin { login_url: String },
-    NormalLogin { login_page_data: SSOLoginPageData },
-}
-
 async fn launch_normal_login_result(
     session: &Session,
     res: Response,
-) -> SSOResult<LoginPageResponse> {
+) -> SSOResult<Option<SSOLoginPageData>> {
     let html = res.text().await?;
     session.set_ruishu_challenge_from_page(&html);
-    Ok(LoginPageResponse::NormalLogin {
-        login_page_data: sso_login_parser(&html).ok_or(ApiError::Website {
+    Ok(Some(sso_login_parser(&html).ok_or(
+        ApiError::ModelParse {
             msg: "Failed to parse login page".to_string(),
-        })?,
-    })
+        },
+    )?))
 }
 
-/// 获取登陆请求所需数据
-pub(super) async fn get_login_request_data(
+/// 获取登陆请求所需数据。
+///
+/// 返回 [`Some(SSOLoginPageData)`] 表示需要提交账号凭据进行登录；
+/// 返回 [`None`] 表示统一身份认证会话已确认为在线有效状态，无需重新提交登录表单。
+pub(crate) async fn get_login_request_data(
     client: &Client,
     session: &mut Session,
     force_relogin: bool,
-) -> SSOResult<LoginPageResponse> {
+) -> SSOResult<Option<SSOLoginPageData>> {
     let res = session.execute(client.get(SSO_LOGIN_URL)).await?;
     match res.status() {
         StatusCode::FOUND => {
@@ -48,27 +44,106 @@ pub(super) async fn get_login_request_data(
                 return launch_normal_login_result(session, local_res).await;
             }
 
-            let jump_url =
-                get_response_header(&res, "Location").ok_or(ApiError::location_error())?;
+            let location =
+                get_response_header(&res, "Location").ok_or_else(ApiError::location_error)?;
+            let redirect_url = res.url().join(location).map_err(|_| ApiError::Website {
+                msg: "Invalid login redirect URL".to_string(),
+            })?;
 
-            let login_url_res = session.execute(client.get(jump_url)).await?;
+            status::validate_login_redirect(res.url(), &redirect_url)?;
 
-            Ok(LoginPageResponse::HasLogin {
-                login_url: get_response_header(&login_url_res, "Location")
-                    .ok_or(ApiError::location_error())?
-                    .to_string(),
-            })
+            if status::is_exact_cas_success_callback(&redirect_url) {
+                let confirmation = session.execute(client.get(SSO_LOGIN_URL)).await?;
+                ensure!(
+                    confirmation.status() == StatusCode::FOUND,
+                    errors::WebsiteSnafu {
+                        msg: "Login redirect did not establish an authenticated CAS session",
+                    }
+                );
+                let confirm_loc = get_response_header(&confirmation, "Location")
+                    .ok_or_else(ApiError::location_error)?;
+                let confirm_target =
+                    confirmation
+                        .url()
+                        .join(confirm_loc)
+                        .map_err(|_| ApiError::Website {
+                            msg: "Invalid login confirmation redirect URL".to_string(),
+                        })?;
+                status::validate_login_redirect(confirmation.url(), &confirm_target)?;
+                ensure!(
+                    status::is_exact_cas_success_callback(&confirm_target),
+                    errors::WebsiteSnafu {
+                        msg: "Login confirmation redirected to unexpected target",
+                    }
+                );
+                return Ok(None);
+            }
+
+            let landing_res = session.execute(client.get(redirect_url.clone())).await?;
+            if landing_res.status().is_success() {
+                let html = landing_res.text().await?;
+                session.set_ruishu_challenge_from_page(&html);
+                if let Some(page) = sso_login_parser(&html) {
+                    return Ok(Some(page));
+                }
+            } else if landing_res.status() == StatusCode::FOUND {
+                let loc2 = get_response_header(&landing_res, "Location")
+                    .ok_or_else(ApiError::location_error)?;
+                let redirect_url2 =
+                    landing_res
+                        .url()
+                        .join(loc2)
+                        .map_err(|_| ApiError::Website {
+                            msg: "Invalid secondary SSO redirect URI format".to_string(),
+                        })?;
+                ensure!(
+                    redirect_url2 != *res.url() && redirect_url2 != redirect_url,
+                    errors::WebsiteSnafu {
+                        msg: "SSO redirect cycle detected",
+                    }
+                );
+                status::validate_login_redirect(landing_res.url(), &redirect_url2)?;
+                if !status::is_exact_cas_success_callback(&redirect_url2) {
+                    let second_landing = session.execute(client.get(redirect_url2)).await?;
+                    if second_landing.status().is_success() {
+                        let html = second_landing.text().await?;
+                        session.set_ruishu_challenge_from_page(&html);
+                        if let Some(page) = sso_login_parser(&html) {
+                            return Ok(Some(page));
+                        }
+                    } else {
+                        return Err(ApiError::HttpStatus {
+                            status: second_landing.status(),
+                        });
+                    }
+                }
+            } else {
+                return Err(ApiError::HttpStatus {
+                    status: landing_res.status(),
+                });
+            }
+
+            let confirmation = session.execute(client.get(SSO_LOGIN_URL)).await?;
+            ensure!(
+                confirmation.status() == StatusCode::FOUND,
+                errors::WebsiteSnafu {
+                    msg: "Login redirect did not establish an authenticated CAS session",
+                }
+            );
+            let confirm_loc = get_response_header(&confirmation, "Location")
+                .ok_or_else(ApiError::location_error)?;
+            let confirm_target =
+                confirmation
+                    .url()
+                    .join(confirm_loc)
+                    .map_err(|_| ApiError::Website {
+                        msg: "Invalid login confirmation redirect URL".to_string(),
+                    })?;
+            status::validate_login_redirect(confirmation.url(), &confirm_target)?;
+            Ok(None)
         }
         StatusCode::OK => launch_normal_login_result(session, res).await,
-        other => Err(SSOError::UnknownSSOError {
-            msg: format!(
-                "status code {} is got (302 expected) when sending login post, \
-            but can not find the element span.login_auth_error#msg",
-                other
-            )
-            .to_string(),
-        }
-        .into()),
+        other => Err(ApiError::HttpStatus { status: other }),
     }
 }
 

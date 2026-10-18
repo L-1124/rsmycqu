@@ -10,9 +10,7 @@ use crate::{
         sso::{SSOError, SSOResult},
     },
     session::{Client, Session},
-    sso::tools::{
-        LoginPageResponse, get_login_request_data, launch_login_data, launch_second_factor_data,
-    },
+    sso::tools::{get_login_request_data, launch_login_data, launch_second_factor_data},
     utils::{
         consts::{
             SSO_CAPTCHA_URL, SSO_LOGIN_URL, SSO_LOGOUT_URL, SSO_MAIL_BINDING_URL,
@@ -23,7 +21,8 @@ use crate::{
     },
 };
 mod encrypt;
-mod tools;
+mod status;
+pub(crate) mod tools;
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -303,49 +302,130 @@ async fn handle_login_response(
     match res.status() {
         StatusCode::FOUND => {
             let location =
-                get_response_header(&res, "Location").ok_or(ApiError::location_error())?;
-            let url = res.url().join(location).map_err(|err| ApiError::Website {
-                msg: format!("Invalid login redirect: {err}"),
+                get_response_header(&res, "Location").ok_or_else(ApiError::location_error)?;
+            let url = res.url().join(location).map_err(|_| ApiError::Website {
+                msg: "Invalid login redirect URL".to_string(),
             })?;
-            let landing = session.execute(client.get(url)).await?;
-            ensure!(
-                landing.status().is_success(),
-                errors::WebsiteSnafu {
-                    msg: format!("Login landing returned HTTP {}", landing.status()),
+            status::validate_login_redirect(res.url(), &url)?;
+
+            if status::is_exact_cas_success_callback(&url) {
+                let confirmation = session.execute(client.get(SSO_LOGIN_URL)).await?;
+                match confirmation.status() {
+                    StatusCode::FOUND => {
+                        let confirm_loc = get_response_header(&confirmation, "Location")
+                            .ok_or_else(ApiError::location_error)?;
+                        let confirm_target =
+                            confirmation.url().join(confirm_loc).map_err(|_| {
+                                ApiError::Website {
+                                    msg: "Invalid login confirmation redirect URL".to_string(),
+                                }
+                            })?;
+                        status::validate_login_redirect(confirmation.url(), &confirm_target)?;
+                        ensure!(
+                            status::is_exact_cas_success_callback(&confirm_target),
+                            errors::WebsiteSnafu {
+                                msg: "Login confirmation redirected to unexpected target",
+                            }
+                        );
+                        session.is_login = true;
+                        return Ok(LoginResult::Success);
+                    }
+                    StatusCode::OK => {
+                        let html = confirmation.text().await?;
+                        session.set_ruishu_challenge_from_page(&html);
+                        if let Some(page) = sso_login_parser(&html) {
+                            return login_page_result(client, session, page).await;
+                        }
+                        return Err(ApiError::Website {
+                            msg: "Login redirect did not establish an authenticated CAS session"
+                                .to_string(),
+                        });
+                    }
+                    other => {
+                        return Err(ApiError::HttpStatus { status: other });
+                    }
                 }
-            );
-            let html = landing.text().await?;
-            session.set_ruishu_challenge_from_page(&html);
-            if let Some(page) = sso_login_parser(&html) {
-                return login_page_result(client, session, page).await;
             }
+
+            let landing = session.execute(client.get(url.clone())).await?;
+            if landing.status().is_success() {
+                let html = landing.text().await?;
+                session.set_ruishu_challenge_from_page(&html);
+                if let Some(page) = sso_login_parser(&html) {
+                    return login_page_result(client, session, page).await;
+                }
+            } else if landing.status() == StatusCode::FOUND {
+                let loc2 = get_response_header(&landing, "Location")
+                    .ok_or_else(ApiError::location_error)?;
+                let url2 = landing.url().join(loc2).map_err(|_| ApiError::Website {
+                    msg: "Invalid secondary SSO redirect URI format".to_string(),
+                })?;
+                ensure!(
+                    url2 != *res.url() && url2 != url,
+                    errors::WebsiteSnafu {
+                        msg: "SSO redirect cycle detected",
+                    }
+                );
+                status::validate_login_redirect(landing.url(), &url2)?;
+                if !status::is_exact_cas_success_callback(&url2) {
+                    let second_landing = session.execute(client.get(url2)).await?;
+                    if second_landing.status().is_success() {
+                        let html = second_landing.text().await?;
+                        session.set_ruishu_challenge_from_page(&html);
+                        if let Some(page) = sso_login_parser(&html) {
+                            return login_page_result(client, session, page).await;
+                        }
+                    } else {
+                        return Err(ApiError::HttpStatus {
+                            status: second_landing.status(),
+                        });
+                    }
+                }
+            } else {
+                return Err(ApiError::Website {
+                    msg: format!("Login landing returned HTTP {}", landing.status()),
+                });
+            }
+
             let confirmation = session.execute(client.get(SSO_LOGIN_URL)).await?;
             ensure!(
-                confirmation.status() == StatusCode::FOUND
-                    && get_response_header(&confirmation, "Location").is_some(),
+                confirmation.status() == StatusCode::FOUND,
                 errors::WebsiteSnafu {
                     msg: "Login redirect did not establish an authenticated CAS session",
                 }
             );
+            let confirm_loc = get_response_header(&confirmation, "Location")
+                .ok_or_else(ApiError::location_error)?;
+            let confirm_target =
+                confirmation
+                    .url()
+                    .join(confirm_loc)
+                    .map_err(|_| ApiError::Website {
+                        msg: "Invalid login confirmation redirect URL".to_string(),
+                    })?;
+            status::validate_login_redirect(confirmation.url(), &confirm_target)?;
             session.is_login = true;
             Ok(LoginResult::Success)
         }
-        StatusCode::UNAUTHORIZED => Ok(LoginResult::IncorrectLoginCredentials),
+        StatusCode::UNAUTHORIZED => {
+            let text = res.text().await?;
+            session.set_ruishu_challenge_from_page(&text);
+            match sso_login_parser(&text) {
+                Some(page) => login_page_result(client, session, page).await,
+                None => Ok(LoginResult::IncorrectLoginCredentials),
+            }
+        }
         StatusCode::OK => {
             let html = res.text().await?;
             session.set_ruishu_challenge_from_page(&html);
-            let page = sso_login_parser(&html).ok_or(ApiError::Website {
+            let page = sso_login_parser(&html).ok_or(ApiError::ModelParse {
                 msg: "Failed to parse re-rendered login page".to_string(),
             })?;
             login_page_result(client, session, page).await
         }
-        other => Err(SSOError::UnknownSSOError {
-            msg: format!("Unexpected status code: {}", other),
-        }
-        .into()),
+        other => Err(ApiError::HttpStatus { status: other }),
     }
 }
-
 /// 登录账号
 ///
 /// 返回 [`LoginResult::CaptchaRequired`] 时需调用 [`captcha_image`] 获取验证码并带码重试；
@@ -361,20 +441,12 @@ pub async fn login(
     let request_data = get_login_request_data(client, session, force_relogin).await?;
 
     match request_data {
-        LoginPageResponse::HasLogin { login_url } => {
-            session.is_login = false;
-            let landing = session.execute(client.get(login_url)).await?;
-            ensure!(
-                landing.status().is_success(),
-                errors::WebsiteSnafu {
-                    msg: format!("Login landing returned HTTP {}", landing.status()),
-                }
-            );
+        None => {
             session.is_login = true;
             Ok(LoginResult::Success)
         }
 
-        LoginPageResponse::NormalLogin { login_page_data } => {
+        Some(login_page_data) => {
             session.is_login = false;
             if !login_page_data.captcha_url.is_empty() && captcha_code.is_none() {
                 return Ok(LoginResult::CaptchaRequired);

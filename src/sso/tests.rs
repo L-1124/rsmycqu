@@ -1229,3 +1229,269 @@ async fn test_submit_second_factor_unsuccessful_state_transitions() {
     assert!(matches!(res2, Err(ApiError::Website { .. })));
     assert!(!session2.is_login());
 }
+
+fn mock_test_login_page(crypto: &str, flowkey: &str) -> String {
+    format!(
+        "<html><body>\
+        <p id=\"login-croypto\">{crypto}</p>\
+        <p id=\"login-page-flowkey\">{flowkey}</p>\
+        <p id=\"current-login-type\">UsernamePassword</p>\
+        </body></html>"
+    )
+}
+
+#[tokio::test]
+async fn test_login_trusted_self_callback_success() {
+    let replies = vec![
+        http_redirect("https://self.cqu.edu.cn/cas-success"),
+        http_redirect("https://self.cqu.edu.cn/cas-success"),
+    ];
+
+    let mut session = Session::new();
+    let s = &mut session;
+    let (result, requests) = run_test_tls_server(replies, |client| async move {
+        login(&client, s, "20201234", "password", false, None).await
+    })
+    .await;
+
+    assert_eq!(result.unwrap(), LoginResult::Success);
+    assert!(session.is_login());
+    assert_eq!(
+        requests
+            .iter()
+            .map(|r| (r.method.as_str(), r.path.as_str()))
+            .collect::<Vec<_>>(),
+        [("GET", "/login"), ("GET", "/login")]
+    );
+}
+
+#[tokio::test]
+async fn test_submit_second_factor_trusted_self_callback_success() {
+    let info = SecondFactorInfo {
+        phone: Some("138****0000".into()),
+        phone_token: Some("token".into()),
+        email: None,
+        execution: "flowkey-2fa-exact".into(),
+    };
+    let info_ref = &info;
+
+    let replies = vec![
+        http_redirect("https://self.cqu.edu.cn/cas-success"),
+        http_redirect("https://self.cqu.edu.cn/cas-success"),
+    ];
+
+    let mut session = Session::new();
+    let s = &mut session;
+    let (result, requests) = run_test_tls_server(replies, |client| {
+        let info = info_ref;
+        async move {
+            submit_second_factor(
+                &client,
+                s,
+                "20201234",
+                info,
+                SecondFactorKind::Sms,
+                "654321",
+            )
+            .await
+        }
+    })
+    .await;
+
+    assert_eq!(result.unwrap(), LoginResult::Success);
+    assert!(session.is_login());
+    assert_eq!(
+        requests
+            .iter()
+            .map(|r| (r.method.as_str(), r.path.as_str()))
+            .collect::<Vec<_>>(),
+        [("POST", "/login"), ("GET", "/login")]
+    );
+}
+
+#[rstest]
+#[case::external_host("https://evil.cqu.com/steal")]
+#[case::http_downgrade("http://self.cqu.edu.cn/cas-success")]
+#[case::alt_port("https://self.cqu.edu.cn:8443/cas-success")]
+#[case::embedded_credentials("https://user:pass@self.cqu.edu.cn/cas-success")]
+#[case::callback_with_query("https://self.cqu.edu.cn/cas-success?ticket=st123")]
+#[case::callback_with_fragment("https://self.cqu.edu.cn/cas-success#fragment")]
+#[case::callback_wrong_path("https://self.cqu.edu.cn/other")]
+#[case::subdomain_spoof("https://self.cqu.edu.cn.attacker.com/cas-success")]
+#[tokio::test]
+async fn test_submit_second_factor_untrusted_cross_host_rejected(#[case] malicious_target: &str) {
+    let info = SecondFactorInfo {
+        phone: Some("138****0000".into()),
+        phone_token: Some("token".into()),
+        email: None,
+        execution: "flowkey-2fa-evil".into(),
+    };
+    let info_ref = &info;
+
+    let replies = vec![http_redirect(malicious_target)];
+
+    let mut session = Session::new();
+    let s = &mut session;
+    let (result, requests) = run_test_tls_server(replies, |client| {
+        let info = info_ref;
+        async move {
+            submit_second_factor(
+                &client,
+                s,
+                "20201234",
+                info,
+                SecondFactorKind::Sms,
+                "654321",
+            )
+            .await
+        }
+    })
+    .await;
+
+    assert!(matches!(result, Err(ApiError::Website { .. })));
+    assert!(!session.is_login());
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[0].path, "/login");
+}
+
+#[tokio::test]
+async fn test_submit_second_factor_loop_or_unauthenticated_confirmation_rejected() {
+    let info = SecondFactorInfo {
+        phone: Some("138****0000".into()),
+        phone_token: Some("token".into()),
+        email: None,
+        execution: "flowkey-2fa-unauth".into(),
+    };
+    let info_ref = &info;
+
+    let replies = vec![
+        http_redirect("/cas-landing"),
+        http_reply("200 OK", "<html><body>Landing</body></html>"),
+        http_reply(
+            "200 OK",
+            &mock_test_login_page("IGEOE4OMIBo=", "flowkey-login-loop"),
+        ),
+    ];
+
+    let mut session = Session::new();
+    let s = &mut session;
+    let (result, requests) = run_test_tls_server(replies, |client| {
+        let info = info_ref;
+        async move {
+            submit_second_factor(
+                &client,
+                s,
+                "20201234",
+                info,
+                SecondFactorKind::Sms,
+                "654321",
+            )
+            .await
+        }
+    })
+    .await;
+
+    assert!(matches!(result, Err(ApiError::Website { .. })));
+    assert!(!session.is_login());
+    assert_eq!(
+        requests
+            .iter()
+            .map(|r| (r.method.as_str(), r.path.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("POST", "/login"),
+            ("GET", "/cas-landing"),
+            ("GET", "/login")
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_login_already_logged_in_same_origin_landing_200_without_second_location() {
+    let replies = vec![
+        http_redirect("/cas-landing"),
+        http_reply(
+            "200 OK",
+            "<html><body>Authenticated App Landing</body></html>",
+        ),
+        http_redirect("/cas-landing"),
+    ];
+
+    let mut session = Session::new();
+    let s = &mut session;
+    let (result, requests) = run_test_tls_server(replies, |client| async move {
+        login(&client, s, "20201234", "password", false, None).await
+    })
+    .await;
+
+    assert_eq!(result.unwrap(), LoginResult::Success);
+    assert!(session.is_login());
+    assert_eq!(
+        requests
+            .iter()
+            .map(|r| (r.method.as_str(), r.path.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("GET", "/login"),
+            ("GET", "/cas-landing"),
+            ("GET", "/login")
+        ]
+    );
+}
+
+#[rstest]
+#[case::external_host("https://evil.cqu.com/steal")]
+#[case::http_downgrade("http://sso.cqu.edu.cn/cas-landing")]
+#[case::alt_port("https://sso.cqu.edu.cn:8443/cas-landing")]
+#[case::embedded_credentials("https://user:pass@sso.cqu.edu.cn/cas-landing")]
+#[tokio::test]
+async fn test_login_already_logged_in_untrusted_redirect_rejected(#[case] malicious_target: &str) {
+    let replies = vec![http_redirect(malicious_target)];
+
+    let mut session = Session::new();
+    let s = &mut session;
+    let (result, requests) = run_test_tls_server(replies, |client| async move {
+        login(&client, s, "20201234", "password", false, None).await
+    })
+    .await;
+
+    assert!(matches!(result, Err(ApiError::Website { .. })));
+    assert!(!session.is_login());
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "GET");
+    assert_eq!(requests[0].path, "/login");
+}
+
+#[tokio::test]
+async fn test_login_already_logged_in_unauthenticated_confirmation_rejected() {
+    let replies = vec![
+        http_redirect("/cas-landing"),
+        http_reply("200 OK", "<html><body>Landing</body></html>"),
+        http_reply(
+            "200 OK",
+            &mock_test_login_page("IGEOE4OMIBo=", "flowkey-login-loop"),
+        ),
+    ];
+
+    let mut session = Session::new();
+    let s = &mut session;
+    let (result, requests) = run_test_tls_server(replies, |client| async move {
+        login(&client, s, "20201234", "password", false, None).await
+    })
+    .await;
+
+    assert!(matches!(result, Err(ApiError::Website { .. })));
+    assert!(!session.is_login());
+    assert_eq!(
+        requests
+            .iter()
+            .map(|r| (r.method.as_str(), r.path.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("GET", "/login"),
+            ("GET", "/cas-landing"),
+            ("GET", "/login")
+        ]
+    );
+}
