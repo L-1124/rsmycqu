@@ -48,4 +48,7 @@ pub enum SessionError {
         /// 缺失特性描述
         msg: String,
     },
+    /// 快照中待完成认证已超过本地有效期
+    #[snafu(display("Pending authentication in snapshot has expired"))]
+    ExpiredAuthentication,
 }

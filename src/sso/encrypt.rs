@@ -1,5 +1,7 @@
 use snafu::ResultExt;
 
+use crate::errors::sso::SSOError;
+
 use crate::{
     errors::sso::{PasswordEncryptSnafu, SSOResult},
     utils::encrypt::*,
@@ -12,6 +14,9 @@ pub(super) fn encrypt_password(
     let crypto = BASE64PURPOSE
         .decode(page_crypto.as_ref())
         .context(PasswordEncryptSnafu {})?;
+    if crypto.is_empty() || crypto.len() > 16 {
+        return Err(SSOError::InvalidPasswordKey.into());
+    }
     let mut crypto_block = [0xff; 16];
     crypto_block[..crypto.len()].copy_from_slice(&crypto);
     let mut pad_password = pad16(password.as_ref().as_bytes());

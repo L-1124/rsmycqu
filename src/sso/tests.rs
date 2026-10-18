@@ -11,8 +11,10 @@ use crate::{
     errors::{ApiError, sso::SSOError},
     session::{Client, Session},
     sso::{
-        LoginResult, SecondFactorInfo, SecondFactorKind, captcha_image, encrypt::encrypt_password,
-        login, send_second_factor_code, submit_second_factor,
+        LoginResult, PendingLoginStatus, SecondFactorInfo, SecondFactorKind, cancel_pending_login,
+        captcha_image, encrypt::encrypt_password, login, pending_captcha_image,
+        pending_login_status, resume_login, send_pending_second_factor_code,
+        send_second_factor_code, start_login, submit_pending_second_factor, submit_second_factor,
     },
     utils::{
         page_parser::SSOLoginPageData,
@@ -584,13 +586,13 @@ async fn test_login_page_result_recognizes_marker_values_without_display_fields(
             user_object_id: "user-123".into(),
         };
         let (result, requests) = run_test_tls_server(replies, |client| async move {
-            super::login_page_result(&client, s, page).await
+            super::login_page_outcome(&client, s, page).await
         })
         .await;
 
-        let result = result.expect("login_page_result should succeed");
+        let result = result.expect("login page classification should succeed");
         match result {
-            super::LoginResult::SecondFactorRequired(info) => {
+            super::LoginResponseOutcome::SecondFactorRequired { info, .. } => {
                 assert_eq!(info.phone, None);
                 assert_eq!(info.phone_token.as_deref(), Some("token-123"));
                 assert_eq!(info.email.as_deref(), Some("user@example.com"));
@@ -618,10 +620,15 @@ async fn test_login_page_result_preserves_false_and_non_second_page() {
         user_object_id: "user-123".into(),
     };
     let (res1, reqs1) = run_test_tls_server(vec![], |client| async move {
-        super::login_page_result(&client, s, page_false).await
+        super::login_page_outcome(&client, s, page_false).await
     })
     .await;
-    assert_eq!(res1.unwrap(), super::LoginResult::IncorrectLoginCredentials);
+    assert!(matches!(
+        res1.unwrap(),
+        super::LoginResponseOutcome::IncorrectCredentials {
+            fresh_page: Some(_)
+        }
+    ));
     assert!(
         reqs1.is_empty(),
         "non-second page should not perform binding lookups"
@@ -639,10 +646,13 @@ async fn test_login_page_result_preserves_false_and_non_second_page() {
         user_object_id: String::new(),
     };
     let (res2, reqs2) = run_test_tls_server(vec![], |client| async move {
-        super::login_page_result(&client, s, page_captcha).await
+        super::login_page_outcome(&client, s, page_captcha).await
     })
     .await;
-    assert_eq!(res2.unwrap(), super::LoginResult::CaptchaRequired);
+    assert!(matches!(
+        res2.unwrap(),
+        super::LoginResponseOutcome::CaptchaRequired { .. }
+    ));
     assert!(reqs2.is_empty());
 }
 
@@ -666,7 +676,7 @@ async fn test_empty_binding_dispatcher_regression_returns_no_second_factor_bindi
         user_object_id: "user-test-obj-id".into(),
     };
     let (result, requests) = run_test_tls_server(replies, |client| async move {
-        super::login_page_result(&client, s, page).await
+        super::login_page_outcome(&client, s, page).await
     })
     .await;
 
@@ -688,6 +698,7 @@ async fn test_empty_binding_dispatcher_regression_returns_no_second_factor_bindi
         "/api/protected/mail/publicNoToken/findMail"
     );
 }
+
 #[rstest]
 #[case::both_unmasked(
     "13800138000",
@@ -722,7 +733,7 @@ async fn test_empty_binding_dispatcher_regression_returns_no_second_factor_bindi
     2
 )]
 #[tokio::test]
-async fn test_login_page_result_prefers_unmasked_ssr_contacts_without_directory_id(
+async fn test_login_page_outcome_prefers_unmasked_ssr_contacts_without_directory_id(
     #[case] ssr_phone: &str,
     #[case] ssr_email: &str,
     #[case] expected_phone_display: Option<&str>,
@@ -765,12 +776,12 @@ async fn test_login_page_result_prefers_unmasked_ssr_contacts_without_directory_
     };
 
     let (result, requests) = run_test_tls_server(replies, |client| async move {
-        super::login_page_result(&client, s, page).await
+        super::login_page_outcome(&client, s, page).await
     })
     .await;
 
     let outcome = result.expect("outcome should succeed");
-    let super::LoginResult::SecondFactorRequired(info) = outcome else {
+    let super::LoginResponseOutcome::SecondFactorRequired { info } = outcome else {
         panic!("expected SecondFactorRequired, got {outcome:?}");
     };
 
@@ -791,7 +802,7 @@ async fn test_login_page_result_prefers_unmasked_ssr_contacts_without_directory_
 
 #[rstest]
 #[tokio::test]
-async fn test_login_page_result_lookup_http_500_propagates_honest_error() {
+async fn test_login_page_outcome_lookup_http_500_propagates_honest_error() {
     let session = Session::new();
     let s = &session;
     let replies = vec![http_reply("500 Internal Server Error", "server error")];
@@ -808,22 +819,22 @@ async fn test_login_page_result_lookup_http_500_propagates_honest_error() {
     };
 
     let (result, requests) = run_test_tls_server(replies, |client| async move {
-        super::login_page_result(&client, s, page).await
+        super::login_page_outcome(&client, s, page).await
     })
     .await;
 
-    assert!(matches!(
-        result,
-        Err(ApiError::HttpStatus {
-            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR
-        })
-    ));
+    match result {
+        Err(ApiError::HttpStatus { status }) => {
+            assert_eq!(status, reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        other => panic!("expected HttpStatus 500 error, got {other:?}"),
+    }
     assert_eq!(requests.len(), 1);
 }
 
 #[rstest]
 #[tokio::test]
-async fn test_login_page_result_masked_contact_missing_object_id_fails_explicitly() {
+async fn test_login_page_outcome_masked_contact_missing_object_id_fails_explicitly() {
     let session = Session::new();
     let s = &session;
     let page = SSOLoginPageData {
@@ -839,7 +850,7 @@ async fn test_login_page_result_masked_contact_missing_object_id_fails_explicitl
     };
 
     let (result, requests) = run_test_tls_server(vec![], |client| async move {
-        super::login_page_result(&client, s, page).await
+        super::login_page_outcome(&client, s, page).await
     })
     .await;
 
@@ -1238,6 +1249,391 @@ fn mock_test_login_page(crypto: &str, flowkey: &str) -> String {
         <p id=\"current-login-type\">UsernamePassword</p>\
         </body></html>"
     )
+}
+
+fn mock_test_captcha_page(crypto: &str, flowkey: &str, payload: &str) -> String {
+    format!(
+        "<html><body>\
+        <p id=\"login-croypto\">{crypto}</p>\
+        <p id=\"login-page-flowkey\">{flowkey}</p>\
+        <p id=\"captcha-url\">api/captcha/generate/DEFAULT</p>\
+        <input name=\"captcha_payload\" value=\"{payload}\" />\
+        <p id=\"current-login-type\">UsernamePassword</p>\
+        </body></html>"
+    )
+}
+
+fn mock_test_2fa_page(flowkey: &str, user_obj: &str, phone: &str, email: &str) -> String {
+    format!(
+        "<html><body>\
+        <p id=\"login-croypto\">crypto2fa</p>\
+        <p id=\"login-page-flowkey\">{flowkey}</p>\
+        <p id=\"sso-second\">smsLogin</p>\
+        <p id=\"phone-number\">{phone}</p>\
+        <p id=\"user-email-value\">{email}</p>\
+        <p id=\"user-object-id\">{user_obj}</p>\
+        <p id=\"current-login-type\">UsernamePassword</p>\
+        </body></html>"
+    )
+}
+
+fn mock_test_captcha_png_reply() -> Vec<u8> {
+    let png = b"\x89PNG\r\n\x1a\nfake_captcha_data";
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        png.len()
+    );
+    let mut res = header.into_bytes();
+    res.extend_from_slice(png);
+    res
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_pending_captcha_snapshot_continuity() {
+    let replies = vec![
+        http_reply(
+            "200 OK",
+            &mock_test_captcha_page("IGEOE4OMIBo=", "initial-flow", "initial-payload"),
+        )
+        .into_bytes(),
+        mock_test_captcha_png_reply(),
+        http_reply(
+            "200 OK",
+            &mock_test_captcha_page("QUJDREVGR0g=", "retry-flow", "retry-payload"),
+        )
+        .into_bytes(),
+        http_redirect("/cas-landing").into_bytes(),
+        http_reply("200 OK", "CAS landing").into_bytes(),
+        http_redirect("/authenticated").into_bytes(),
+    ];
+    let ((), requests) = run_test_tls_server_raw(replies, |client| async move {
+        let mut session = Session::new();
+        assert_eq!(
+            start_login(
+                &client,
+                &mut session,
+                "fixed-account",
+                "never-save-this-password"
+            )
+            .await
+            .unwrap(),
+            PendingLoginStatus::CaptchaRequired
+        );
+        let snapshot = session.export_snapshot().unwrap();
+        assert!(!snapshot.contains("never-save-this-password"));
+        let mut restored = Session::from_snapshot(&snapshot).unwrap();
+        assert!(
+            pending_captcha_image(&client, &restored)
+                .await
+                .unwrap()
+                .starts_with(b"\x89PNG\r\n\x1a\n")
+        );
+        assert_eq!(
+            resume_login(&client, &mut restored, "synthetic-password", Some("wrong"))
+                .await
+                .unwrap(),
+            PendingLoginStatus::CaptchaRequired
+        );
+        let mut restored = Session::from_snapshot(&restored.export_snapshot().unwrap()).unwrap();
+        assert_eq!(
+            resume_login(&client, &mut restored, "synthetic-password", Some("1234"))
+                .await
+                .unwrap(),
+            PendingLoginStatus::Completed
+        );
+        assert!(restored.is_login());
+        assert!(restored.pending_login.is_none());
+    })
+    .await;
+    assert_eq!(
+        requests
+            .iter()
+            .map(|r| (r.method.as_str(), r.path.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("GET", "/login"),
+            ("GET", "/api/captcha/generate/DEFAULT"),
+            ("POST", "/login"),
+            ("POST", "/login"),
+            ("GET", "/cas-landing"),
+            ("GET", "/login")
+        ]
+    );
+    let form = |index: usize| {
+        reqwest::Url::parse(&format!(
+            "http://localhost/?{}",
+            String::from_utf8_lossy(&requests[index].body)
+        ))
+        .unwrap()
+        .query_pairs()
+        .into_owned()
+        .collect::<HashMap<_, _>>()
+    };
+    let first = form(2);
+    let retry = form(3);
+    assert_eq!(first["execution"], "initial-flow");
+    assert_eq!(retry["execution"], "retry-flow");
+    assert_eq!(retry["captcha_payload"], "retry-payload");
+    assert_eq!(retry["croypto"], "QUJDREVGR0g=");
+    assert_eq!(retry["username"], "fixed-account");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_pending_second_factor_resend_and_snapshot() {
+    let replies = vec![
+        http_reply(
+            "200 OK",
+            &mock_test_login_page("IGEOE4OMIBo=", "password-flow"),
+        ),
+        http_reply(
+            "200 OK",
+            &mock_test_2fa_page("second-flow", "user-object", "138****1234", ""),
+        ),
+        http_reply(
+            "200 OK",
+            r#"{"code":200,"data":{"tel":"private-phone-token"}}"#,
+        ),
+        http_reply("200 OK", r#"{"code":200,"data":"学@example.com"}"#),
+        http_reply("200 OK", r#"{"code":200,"data":{"result":true}}"#),
+        http_reply("200 OK", r#"{"code":200,"data":{"result":true}}"#),
+        http_reply(
+            "401 Unauthorized",
+            &mock_test_2fa_page("retry-second-flow", "user-object", "138****1234", ""),
+        ),
+        http_reply(
+            "200 OK",
+            r#"{"code":200,"data":{"tel":"refreshed-phone-token"}}"#,
+        ),
+        http_reply("200 OK", r#"{"code":200,"data":"学@example.com"}"#),
+        http_redirect("/cas-landing"),
+        http_reply("200 OK", "CAS landing"),
+        http_redirect("/authenticated"),
+    ];
+    let ((), requests) = run_test_tls_server(replies, |client| async move {
+        let mut session = Session::new();
+        assert!(matches!(
+            start_login(&client, &mut session, "fixed-account", "synthetic-password")
+                .await
+                .unwrap(),
+            PendingLoginStatus::SecondFactor(_)
+        ));
+        let mut restored = Session::from_snapshot(&session.export_snapshot().unwrap()).unwrap();
+        let status = pending_login_status(&restored).unwrap();
+        let PendingLoginStatus::SecondFactor(channels) = &status else {
+            panic!("expected second factor")
+        };
+        assert!(channels.sms_available && channels.mail_available);
+        for secret in ["private-phone-token", "second-flow", "学@example.com"] {
+            assert!(!format!("{restored:?} {status:?}").contains(secret));
+        }
+        let before: serde_json::Value =
+            serde_json::from_str(&restored.export_snapshot().unwrap()).unwrap();
+        send_pending_second_factor_code(&client, &restored, SecondFactorKind::Sms)
+            .await
+            .unwrap();
+        send_pending_second_factor_code(&client, &restored, SecondFactorKind::Sms)
+            .await
+            .unwrap();
+        let after: serde_json::Value =
+            serde_json::from_str(&restored.export_snapshot().unwrap()).unwrap();
+        assert_eq!(
+            before["pending_login"]["expires_at"],
+            after["pending_login"]["expires_at"]
+        );
+        assert!(matches!(
+            submit_pending_second_factor(
+                &client,
+                &mut restored,
+                SecondFactorKind::Sms,
+                "wrong-code"
+            )
+            .await
+            .unwrap(),
+            PendingLoginStatus::SecondFactor(_)
+        ));
+        let mut restored = Session::from_snapshot(&restored.export_snapshot().unwrap()).unwrap();
+        assert_eq!(
+            submit_pending_second_factor(&client, &mut restored, SecondFactorKind::Sms, "654321")
+                .await
+                .unwrap(),
+            PendingLoginStatus::Completed
+        );
+        assert!(restored.pending_login.is_none());
+    })
+    .await;
+    assert_eq!(requests.len(), 12);
+    let wrong_form = String::from_utf8_lossy(&requests[6].body);
+    assert!(wrong_form.contains("execution=second-flow"));
+    let form = String::from_utf8_lossy(&requests[9].body);
+    assert!(form.contains("execution=retry-second-flow"));
+    assert!(form.contains("username=fixed-account"));
+}
+
+#[rstest::fixture]
+fn pending_second_factor_session() -> Session {
+    let mut snapshot: serde_json::Value =
+        serde_json::from_str(&Session::new().export_snapshot().unwrap()).unwrap();
+    snapshot["pending_login"] = serde_json::json!({
+        "account": "fixed-account",
+        "expires_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 100,
+        "stage": {"SecondFactor": {"info": {
+            "phone": null, "phone_token": "fixture-token", "email": null, "execution": "fixture-execution"
+        }}}
+    });
+    Session::from_snapshot(&snapshot.to_string()).unwrap()
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_pending_expiry_prevents_requests(mut pending_second_factor_session: Session) {
+    let session = &mut pending_second_factor_session;
+    let mut snapshot: serde_json::Value =
+        serde_json::from_str(&session.export_snapshot().unwrap()).unwrap();
+    snapshot["pending_login"]["expires_at"] = 0.into();
+    assert!(matches!(
+        Session::from_snapshot(&snapshot.to_string()),
+        Err(crate::errors::session::SessionError::ExpiredAuthentication)
+    ));
+    session.pending_login = serde_json::from_value(snapshot["pending_login"].clone()).unwrap();
+    let ((), requests) = run_test_tls_server(vec![], |client| async move {
+        assert_eq!(
+            pending_login_status(session).unwrap(),
+            PendingLoginStatus::Expired
+        );
+        assert!(matches!(
+            pending_captcha_image(&client, session).await,
+            Err(ApiError::Inner {
+                source: SSOError::PendingLoginExpired
+            })
+        ));
+        assert!(matches!(
+            resume_login(&client, session, "synthetic-password", Some("1234")).await,
+            Err(ApiError::Inner {
+                source: SSOError::PendingLoginExpired
+            })
+        ));
+        assert!(matches!(
+            send_pending_second_factor_code(&client, session, SecondFactorKind::Sms).await,
+            Err(ApiError::Inner {
+                source: SSOError::PendingLoginExpired
+            })
+        ));
+        assert!(matches!(
+            submit_pending_second_factor(&client, session, SecondFactorKind::Sms, "1234").await,
+            Err(ApiError::Inner {
+                source: SSOError::PendingLoginExpired
+            })
+        ));
+        assert!(matches!(
+            session.export_snapshot(),
+            Err(crate::errors::session::SessionError::ExpiredAuthentication)
+        ));
+    })
+    .await;
+    assert!(requests.is_empty());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_pending_rejected_execution_cannot_be_replayed(
+    mut pending_second_factor_session: Session,
+) {
+    let session = &mut pending_second_factor_session;
+    let ((), requests) = run_test_tls_server(
+        vec![http_reply("401 Unauthorized", "")],
+        |client| async move {
+            assert_eq!(
+                submit_pending_second_factor(&client, session, SecondFactorKind::Sms, "wrong")
+                    .await
+                    .unwrap(),
+                PendingLoginStatus::Invalidated
+            );
+            assert!(matches!(
+                submit_pending_second_factor(&client, session, SecondFactorKind::Sms, "next").await,
+                Err(ApiError::Inner {
+                    source: SSOError::PendingLoginInvalidated { .. }
+                })
+            ));
+            let mut restored = Session::from_snapshot(&session.export_snapshot().unwrap()).unwrap();
+            assert_eq!(
+                pending_login_status(&restored).unwrap(),
+                PendingLoginStatus::Invalidated
+            );
+            cancel_pending_login(&mut restored).unwrap();
+            assert!(!restored.is_login());
+            assert!(restored.pending_login.is_none());
+        },
+    )
+    .await;
+    assert_eq!(requests.len(), 1);
+}
+
+#[rstest]
+#[case::missing_execution("execution", serde_json::json!(""))]
+#[case::missing_bindings("phone_token", serde_json::Value::Null)]
+fn test_pending_snapshot_rejects_invalid_stage(
+    pending_second_factor_session: Session,
+    #[case] field: &str,
+    #[case] value: serde_json::Value,
+) {
+    let mut snapshot: serde_json::Value =
+        serde_json::from_str(&pending_second_factor_session.export_snapshot().unwrap()).unwrap();
+    snapshot["pending_login"]["stage"]["SecondFactor"]["info"][field] = value;
+    assert!(matches!(
+        Session::from_snapshot(&snapshot.to_string()),
+        Err(crate::errors::session::SessionError::SnapshotError { .. })
+    ));
+}
+
+#[rstest]
+#[case::empty("")]
+#[case::oversized("AAAAAAAAAAAAAAAAAAAAAAA=")]
+fn test_password_key_boundaries(#[case] key: &str) {
+    assert!(matches!(
+        encrypt_password(key, "synthetic-password"),
+        Err(ApiError::Inner {
+            source: SSOError::InvalidPasswordKey
+        })
+    ));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_pending_start_discards_previous_identity() {
+    let mut session = Session::new();
+    session.is_login = true;
+    #[cfg(feature = "mycqu")]
+    {
+        session.access_infos.mycqu_access_info =
+            Some(crate::session::access_info::MyCQUAccessInfo {
+                auth_header: "previous-account-token".to_string(),
+            });
+    }
+    let replies = vec![
+        http_redirect("/previous-account"),
+        http_reply("200 OK", ""),
+        http_reply(
+            "200 OK",
+            &mock_test_captcha_page("IGEOE4OMIBo=", "new-account-flow", "payload"),
+        ),
+    ];
+    let ((), requests) = run_test_tls_server(replies, |client| async move {
+        assert_eq!(
+            start_login(&client, &mut session, "new-account", "synthetic-password")
+                .await
+                .unwrap(),
+            PendingLoginStatus::CaptchaRequired
+        );
+        assert!(!session.is_login());
+        assert!(session.access_infos().is_empty());
+    })
+    .await;
+    assert_eq!(
+        requests.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+        ["/login", "/logout", "/login"]
+    );
 }
 
 #[tokio::test]

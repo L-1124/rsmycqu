@@ -8,7 +8,8 @@ fn selector(selector: &str) -> Selector {
     Selector::parse(selector).expect("static selector should be valid")
 }
 
-#[derive(Eq, PartialEq, Debug)]
+#[derive(Eq, PartialEq, Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SSOLoginPageData {
     pub(crate) login_croypto: String,
     pub(crate) login_page_flowkey: String,

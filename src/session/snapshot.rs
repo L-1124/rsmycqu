@@ -37,6 +37,8 @@ pub(crate) struct SessionSnapshotData {
     pub(crate) ruishu: RuishuSnapshot,
     /// 未过期 Cookies 列表
     pub(crate) cookies: Vec<cookie_store::Cookie<'static>>,
+    /// 待完成认证也属于会话敏感状态；无 SSO 构建仅允许 null。
+    pub(crate) pending_login: serde_json::Value,
 }
 
 /// 服务访问凭据快照
@@ -153,6 +155,24 @@ impl Session {
             (RuishuSnapshot { challenge, basearr }, cookies)
         };
 
+        let pending_login = {
+            #[cfg(feature = "sso")]
+            {
+                if let Some(state) = &self.pending_login {
+                    state.validate(self.is_login, !self.access_infos.is_empty())?;
+                }
+                serde_json::to_value(&self.pending_login).map_err(|_| {
+                    SessionError::SnapshotError {
+                        msg: "failed to serialize pending authentication".to_string(),
+                    }
+                })?
+            }
+            #[cfg(not(feature = "sso"))]
+            {
+                serde_json::Value::Null
+            }
+        };
+
         let snapshot_data = SessionSnapshotData {
             version: CURRENT_SNAPSHOT_VERSION,
             features,
@@ -160,6 +180,7 @@ impl Session {
             access_infos: access_snapshot,
             ruishu: ruishu_snapshot,
             cookies,
+            pending_login,
         };
 
         serde_json::to_string(&snapshot_data).map_err(|_| SessionError::SnapshotError {
@@ -301,11 +322,32 @@ impl Session {
         .map_err(|_| SessionError::SnapshotError {
             msg: "failed to populate cookie store from snapshot".to_string(),
         })?;
+        #[cfg(feature = "sso")]
+        let pending_login: Option<crate::sso::pending::PendingLoginState> = {
+            let pending: Option<crate::sso::pending::PendingLoginState> =
+                serde_json::from_value(data.pending_login).map_err(|_| {
+                    SessionError::SnapshotError {
+                        msg: "invalid pending authentication structure".to_string(),
+                    }
+                })?;
+            if let Some(state) = &pending {
+                state.validate(data.is_login, !access_infos.is_empty())?;
+            }
+            pending
+        };
+        #[cfg(not(feature = "sso"))]
+        if !data.pending_login.is_null() {
+            return Err(SessionError::FeatureMismatch {
+                msg: "snapshot contains pending SSO authentication".to_string(),
+            });
+        }
 
         Ok(Session {
             cookie_jar: Arc::new(InternalCookieStore::from_store(cookie_store)),
             is_login: data.is_login,
             access_infos,
+            #[cfg(feature = "sso")]
+            pending_login,
             ruishu_state: Arc::new(RwLock::new(ruishu_state)),
             ruishu_mainjs: Arc::new(RwLock::new(None)),
         })

@@ -38,6 +38,8 @@ pub struct Session {
     pub(crate) is_login: bool,
     /// 登陆后获取到的各服务访问信息
     pub(crate) access_infos: AccessInfos,
+    #[cfg(feature = "sso")]
+    pub(crate) pending_login: Option<crate::sso::pending::PendingLoginState>,
     // 挑战与内层密文在同一锁下更新，避免刷新时混用。
     ruishu_state: Arc<RwLock<RuishuState>>,
     /// 站点外层脚本，部署期固定；用于在会话尚未有 `basearr` 时纯算补出
@@ -77,6 +79,8 @@ impl Session {
             cookie_jar: Arc::new(InternalCookieStore::new()),
             is_login: false,
             access_infos: AccessInfos::default(),
+            #[cfg(feature = "sso")]
+            pending_login: None,
             ruishu_state: Arc::new(RwLock::new(RuishuState::default())),
             ruishu_mainjs: Arc::new(RwLock::new(None)),
         }

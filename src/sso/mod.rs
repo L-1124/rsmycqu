@@ -20,12 +20,18 @@ use crate::{
         page_parser::{SSOLoginPageData, sso_login_parser},
     },
 };
+pub(crate) mod pending;
+pub use pending::{
+    PendingLoginStatus, PendingSecondFactorStatus, cancel_pending_login, pending_captcha_image,
+    pending_login_status, resume_login, send_pending_second_factor_code, start_login,
+    submit_pending_second_factor,
+};
+
 mod encrypt;
 mod status;
-pub(crate) mod tools;
-
 #[cfg(test)]
 pub(crate) mod tests;
+pub(crate) mod tools;
 
 /// 退出账号登陆
 pub async fn logout(client: &Client, session: &mut Session) -> SSOResult<()> {
@@ -34,6 +40,8 @@ pub async fn logout(client: &Client, session: &mut Session) -> SSOResult<()> {
         .await
         .map_err(|_| SSOError::LogoutError)?;
     session.is_login = false;
+    session.pending_login = None;
+    session.access_infos = Default::default();
 
     Ok(())
 }
@@ -148,11 +156,25 @@ pub(crate) fn mask_phone(phone: &str) -> String {
     }
 }
 
-async fn login_page_result(
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum LoginResponseOutcome {
+    Success,
+    IncorrectCredentials {
+        fresh_page: Option<SSOLoginPageData>,
+    },
+    CaptchaRequired {
+        page: SSOLoginPageData,
+    },
+    SecondFactorRequired {
+        info: Box<SecondFactorInfo>,
+    },
+}
+
+async fn login_page_outcome(
     client: &Client,
     session: &Session,
     page: SSOLoginPageData,
-) -> SSOResult<LoginResult> {
+) -> SSOResult<LoginResponseOutcome> {
     let is_second_factor = page.sso_second != "false"
         && (matches!(page.sso_second.as_str(), "true" | "smsLogin" | "mailLogin")
             || page.current_login_type == "smsLogin"
@@ -221,11 +243,15 @@ async fn login_page_result(
         if info.phone_token.is_none() && info.email.is_none() {
             return Err(SSOError::NoSecondFactorBindings.into());
         }
-        Ok(LoginResult::SecondFactorRequired(Box::new(info)))
+        Ok(LoginResponseOutcome::SecondFactorRequired {
+            info: Box::new(info),
+        })
     } else if !page.captcha_url.is_empty() {
-        Ok(LoginResult::CaptchaRequired)
+        Ok(LoginResponseOutcome::CaptchaRequired { page })
     } else {
-        Ok(LoginResult::IncorrectLoginCredentials)
+        Ok(LoginResponseOutcome::IncorrectCredentials {
+            fresh_page: Some(page),
+        })
     }
 }
 
@@ -272,8 +298,7 @@ fn parse_binding(
         }),
     }
 }
-
-fn bound_contact(info: &SecondFactorInfo, kind: SecondFactorKind) -> SSOResult<&str> {
+pub(crate) fn bound_contact(info: &SecondFactorInfo, kind: SecondFactorKind) -> SSOResult<&str> {
     let phone = info
         .phone_token
         .as_deref()
@@ -293,11 +318,11 @@ fn bound_contact(info: &SecondFactorInfo, kind: SecondFactorKind) -> SSOResult<&
     }
 }
 
-async fn handle_login_response(
+pub(crate) async fn handle_login_response_internal(
     client: &Client,
     session: &mut Session,
     res: Response,
-) -> SSOResult<LoginResult> {
+) -> SSOResult<LoginResponseOutcome> {
     session.is_login = false;
     match res.status() {
         StatusCode::FOUND => {
@@ -328,13 +353,13 @@ async fn handle_login_response(
                             }
                         );
                         session.is_login = true;
-                        return Ok(LoginResult::Success);
+                        return Ok(LoginResponseOutcome::Success);
                     }
                     StatusCode::OK => {
                         let html = confirmation.text().await?;
                         session.set_ruishu_challenge_from_page(&html);
                         if let Some(page) = sso_login_parser(&html) {
-                            return login_page_result(client, session, page).await;
+                            return login_page_outcome(client, session, page).await;
                         }
                         return Err(ApiError::Website {
                             msg: "Login redirect did not establish an authenticated CAS session"
@@ -352,7 +377,7 @@ async fn handle_login_response(
                 let html = landing.text().await?;
                 session.set_ruishu_challenge_from_page(&html);
                 if let Some(page) = sso_login_parser(&html) {
-                    return login_page_result(client, session, page).await;
+                    return login_page_outcome(client, session, page).await;
                 }
             } else if landing.status() == StatusCode::FOUND {
                 let loc2 = get_response_header(&landing, "Location")
@@ -373,7 +398,7 @@ async fn handle_login_response(
                         let html = second_landing.text().await?;
                         session.set_ruishu_challenge_from_page(&html);
                         if let Some(page) = sso_login_parser(&html) {
-                            return login_page_result(client, session, page).await;
+                            return login_page_outcome(client, session, page).await;
                         }
                     } else {
                         return Err(ApiError::HttpStatus {
@@ -405,14 +430,14 @@ async fn handle_login_response(
                     })?;
             status::validate_login_redirect(confirmation.url(), &confirm_target)?;
             session.is_login = true;
-            Ok(LoginResult::Success)
+            Ok(LoginResponseOutcome::Success)
         }
         StatusCode::UNAUTHORIZED => {
             let text = res.text().await?;
             session.set_ruishu_challenge_from_page(&text);
             match sso_login_parser(&text) {
-                Some(page) => login_page_result(client, session, page).await,
-                None => Ok(LoginResult::IncorrectLoginCredentials),
+                Some(page) => login_page_outcome(client, session, page).await,
+                None => Ok(LoginResponseOutcome::IncorrectCredentials { fresh_page: None }),
             }
         }
         StatusCode::OK => {
@@ -421,11 +446,28 @@ async fn handle_login_response(
             let page = sso_login_parser(&html).ok_or(ApiError::ModelParse {
                 msg: "Failed to parse re-rendered login page".to_string(),
             })?;
-            login_page_result(client, session, page).await
+            login_page_outcome(client, session, page).await
         }
         other => Err(ApiError::HttpStatus { status: other }),
     }
 }
+
+async fn handle_login_response(
+    client: &Client,
+    session: &mut Session,
+    res: Response,
+) -> SSOResult<LoginResult> {
+    let outcome = handle_login_response_internal(client, session, res).await?;
+    Ok(match outcome {
+        LoginResponseOutcome::Success => LoginResult::Success,
+        LoginResponseOutcome::IncorrectCredentials { .. } => LoginResult::IncorrectLoginCredentials,
+        LoginResponseOutcome::CaptchaRequired { .. } => LoginResult::CaptchaRequired,
+        LoginResponseOutcome::SecondFactorRequired { info, .. } => {
+            LoginResult::SecondFactorRequired(info)
+        }
+    })
+}
+
 /// 登录账号
 ///
 /// 返回 [`LoginResult::CaptchaRequired`] 时需调用 [`captcha_image`] 获取验证码并带码重试；
@@ -438,6 +480,8 @@ pub async fn login(
     force_relogin: bool,
     captcha_code: Option<&str>,
 ) -> SSOResult<LoginResult> {
+    session.pending_login = None;
+    session.access_infos = Default::default();
     let request_data = get_login_request_data(client, session, force_relogin).await?;
 
     match request_data {
@@ -470,6 +514,8 @@ pub async fn submit_second_factor(
     code: impl AsRef<str>,
 ) -> SSOResult<LoginResult> {
     bound_contact(info, kind)?;
+    session.pending_login = None;
+    session.access_infos = Default::default();
     let data = launch_second_factor_data(auth, code, kind.login_type(), &info.execution);
     let res = session
         .execute(client.post(SSO_LOGIN_URL).form(&data))
@@ -499,8 +545,6 @@ struct SendCodeResponse {
     #[serde(default)]
     code: Option<u32>,
     #[serde(default)]
-    message: Option<String>,
-    #[serde(default)]
     data: Option<serde_json::Value>,
 }
 
@@ -514,10 +558,7 @@ async fn handle_send_code_response(res: Response, method: &str) -> SSOResult<()>
     }
 
     if !status.is_success() {
-        return Err(SSOError::SecondFactorError {
-            msg: format!("{method} HTTP status {status}"),
-        }
-        .into());
+        return Err(ApiError::HttpStatus { status });
     }
 
     let body = res.text().await?;
@@ -542,15 +583,12 @@ fn parse_second_factor_response(body: &str, method: &str) -> SSOResult<SendCodeR
         msg: format!("{method} returned an invalid JSON response"),
     })?;
     if resp.code != Some(200) {
-        let err_msg = resp
-            .data
-            .as_ref()
-            .and_then(|data| data.get("errorMessage"))
-            .and_then(|value| value.as_str())
-            .or(resp.message.as_deref())
-            .unwrap_or("unknown error");
+        let code = resp
+            .code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "none".to_string());
         return Err(SSOError::SecondFactorError {
-            msg: format!("{method} failed with code {:?}: {err_msg}", resp.code),
+            msg: format!("{method} rejected with code {code}"),
         }
         .into());
     }
