@@ -15,7 +15,10 @@ use std::sync::{Arc, RwLock};
 use cookie_store::CookieStore;
 use serde::{Deserialize, Serialize};
 
-use super::{RuishuState, Session, access_info::AccessInfos, cookie_store::InternalCookieStore};
+use super::{
+    RUISHU_MAINJS_ROOT, RuishuState, Session, access_info::AccessInfos,
+    cookie_store::InternalCookieStore,
+};
 use crate::errors::session::SessionError;
 
 /// 当前快照格式规范版本
@@ -59,6 +62,9 @@ pub(crate) struct RuishuSnapshot {
     pub(crate) challenge: Option<RuishuChallengeSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) basearr: Option<String>,
+    /// 页面记录的外层脚本地址；跨进程恢复后据此按需拉取脚本，无需重新登录
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mainjs_src: Option<String>,
 }
 
 /// 瑞数页面挑战快照
@@ -151,8 +157,16 @@ impl Session {
                     nsd: *nsd,
                 });
             let basearr = state.basearr.as_deref().map(hex::encode);
+            let mainjs_src = state.mainjs_src.as_ref().map(|u| u.to_string());
             let cookies = self.cookie_jar.export_unexpired()?;
-            (RuishuSnapshot { challenge, basearr }, cookies)
+            (
+                RuishuSnapshot {
+                    challenge,
+                    basearr,
+                    mainjs_src,
+                },
+                cookies,
+            )
         };
 
         let pending_login = {
@@ -288,7 +302,37 @@ impl Session {
                 })?,
         };
 
+        let mainjs_src = match data.ruishu.mainjs_src {
+            Some(src_str) => {
+                let sso_base = reqwest::Url::parse(RUISHU_MAINJS_ROOT).map_err(|_| {
+                    SessionError::SnapshotError {
+                        msg: "failed to parse default sso root".to_string(),
+                    }
+                })?;
+                let resolved =
+                    sso_base
+                        .join(&src_str)
+                        .map_err(|_| SessionError::SnapshotError {
+                            msg: "invalid mainjs script URL syntax in snapshot".to_string(),
+                        })?;
+                super::validate_script_url(&resolved).map_err(|_| SessionError::SnapshotError {
+                    msg: "unsafe mainjs script URL in snapshot".to_string(),
+                })?;
+                Some(resolved)
+            }
+            None => None,
+        };
         let challenge = data.ruishu.challenge.map(|c| (c.cd, c.nsd));
+        let active_host = mainjs_src
+            .as_ref()
+            .and_then(|u| u.host_str().map(ToString::to_string))
+            .or_else(|| {
+                if challenge.is_some() {
+                    Some("sso.cqu.edu.cn".to_string())
+                } else {
+                    None
+                }
+            });
         let basearr = match data.ruishu.basearr {
             Some(hex_str) => {
                 let bytes = hex::decode(&hex_str).map_err(|_| SessionError::SnapshotError {
@@ -311,7 +355,12 @@ impl Session {
             None => None,
         };
 
-        let ruishu_state = RuishuState { basearr, challenge };
+        let ruishu_state = RuishuState {
+            basearr,
+            challenge,
+            mainjs_src,
+            active_host,
+        };
 
         let cookie_store = CookieStore::from_cookies(
             data.cookies

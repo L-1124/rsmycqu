@@ -1,6 +1,7 @@
 //! 在[`reqwest::Client`]的基础上增加了额外的状态以保证库运行正确性
 
-use std::sync::{Arc, RwLock};
+use scraper::{Html, Selector};
+use std::sync::{Arc, LazyLock, RwLock};
 
 pub use client::Client;
 pub use reqwest;
@@ -22,11 +23,24 @@ pub use snapshot::CURRENT_SNAPSHOT_VERSION;
 #[cfg(test)]
 mod tests;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct RuishuState {
     basearr: Option<Arc<[u8]>>,
     challenge: Option<(String, u32)>,
+    mainjs_src: Option<reqwest::Url>,
+    active_host: Option<String>,
 }
+
+/// 无响应 URL 的旧接口默认使用 SSO 来源。
+pub(crate) const RUISHU_MAINJS_ROOT: &str = "https://sso.cqu.edu.cn/";
+
+static SCRIPT_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("static script reqwest client")
+});
 
 /// 发起校园信息请求的会话
 ///
@@ -122,8 +136,25 @@ impl Session {
                     .iter()
                     .any(|h| has_cookie_t(h, cookie_t_name))
             {
-                self.refresh_ruishu_cookie(request.url())?;
-                cookie_header = self.cookie_jar.get_header_value(request.url())?;
+                let should_preempt = {
+                    let state = self
+                        .ruishu_state
+                        .read()
+                        .map_err(|_| SessionError::LockError {
+                            msg: "ruishu_state read lock poisoned".to_string(),
+                        })?;
+                    state.challenge.is_some()
+                        && state
+                            .active_host
+                            .as_deref()
+                            .is_some_and(|h| Some(h) == request.url().host_str())
+                };
+
+                if should_preempt {
+                    self.ensure_ruishu_material().await?;
+                    self.refresh_ruishu_cookie(request.url())?;
+                    cookie_header = self.cookie_jar.get_header_value(request.url())?;
+                }
             }
             if let Some(cookie_header) = cookie_header {
                 request.headers_mut().append(header::COOKIE, cookie_header);
@@ -147,27 +178,142 @@ impl Session {
                 .map_err(|e| SessionError::Build {
                     source: e.without_url(),
                 })?;
-            let response_url = response.url();
+            let response_url = response.url().clone();
             for cookie_str in response
                 .headers()
                 .get_all(header::SET_COOKIE)
                 .iter()
                 .filter_map(|v| v.to_str().ok())
             {
-                self.cookie_jar.add_cookie_str(cookie_str, response_url)?;
+                self.cookie_jar.add_cookie_str(cookie_str, &response_url)?;
             }
 
             let Some(retry) = retry_request.take() else {
                 return Ok(response);
             };
-            if !is_ruishu_blocked(response_url, response.status()) {
+            if !is_ruishu_blocked(&response_url, response.status()) {
                 return Ok(response);
             }
-            if !self.refresh_ruishu_cookie(response_url)? {
-                return Ok(response);
+
+            // 412 页面本身就是本次请求主机的瑞数挑战页：采纳其中的挑战后再重算。
+            // 挑战是各站点独立的（sso 与 my.cqu 的 cd/nsd 不同），Cookie T 名称
+            // 也按 host 区分，因此切换站点时多一次 412 往返即可自愈。
+            let body = response.text().await.map_err(|e| SessionError::Build {
+                source: e.without_url(),
+            })?;
+            let cd_opt = extract_ts_cd(&body);
+            let nsd_opt = extract_ts_nsd(&body);
+
+            let (cd, nsd) = match (cd_opt, nsd_opt) {
+                (Some(cd), Some(nsd)) => (cd.to_string(), nsd),
+                (None, None) => {
+                    let state = self
+                        .ruishu_state
+                        .read()
+                        .map_err(|_| SessionError::LockError {
+                            msg: "ruishu_state read lock poisoned".to_string(),
+                        })?;
+                    let host_matches = state
+                        .active_host
+                        .as_deref()
+                        .is_some_and(|h| Some(h) == response_url.host_str());
+                    match &state.challenge {
+                        Some((curr_cd, curr_nsd)) if host_matches => (curr_cd.clone(), *curr_nsd),
+                        _ => {
+                            return Err(SessionError::RuishuError {
+                                msg: "412 response carried no usable challenge".to_string(),
+                            });
+                        }
+                    }
+                }
+                _ => {
+                    return Err(SessionError::RuishuError {
+                        msg: "412 response carried no usable challenge".to_string(),
+                    });
+                }
+            };
+
+            let script_url = match extract_mainjs_src(&body) {
+                Some(src) => Some(resolve_and_validate_script_url(&response_url, &src)?),
+                None => None,
+            };
+
+            self.adopt_challenge_for_response(&response_url, &cd, nsd, script_url)?;
+            self.ensure_ruishu_material().await?;
+            if !self.refresh_ruishu_cookie(&response_url)? {
+                return Err(SessionError::RuishuError {
+                    msg: "failed to generate Cookie T after 412".to_string(),
+                });
             }
             request = retry;
         }
+    }
+
+    /// 确保会话具备重算 Cookie T 的材料（`basearr` 或 `mainjs`）。
+    ///
+    /// 页面挑战存在但两者皆无时，按页面记录的外层脚本地址自动下载一次并缓存，
+    /// 供之后纯算复用。脚本请求不携带会话 Cookie。
+    async fn ensure_ruishu_material(&self) -> Result<(), SessionError> {
+        let (has_challenge, has_basearr, has_cached_mainjs, target_src) = {
+            let state = self
+                .ruishu_state
+                .read()
+                .map_err(|_| SessionError::LockError {
+                    msg: "ruishu_state read lock poisoned".to_string(),
+                })?;
+            let has_challenge = state.challenge.is_some();
+            let has_basearr = state.basearr.is_some();
+            let has_cached_mainjs = self
+                .ruishu_mainjs
+                .read()
+                .map_err(|_| SessionError::LockError {
+                    msg: "ruishu_mainjs read lock poisoned".to_string(),
+                })?
+                .is_some();
+            let target_src = state.mainjs_src.clone();
+            (has_challenge, has_basearr, has_cached_mainjs, target_src)
+        };
+
+        if !has_challenge || has_basearr || has_cached_mainjs {
+            return Ok(());
+        }
+
+        let script_url = target_src.ok_or_else(|| SessionError::RuishuError {
+            msg: "basearr missing and no site mainjs script recorded from page".to_string(),
+        })?;
+
+        let response = SCRIPT_CLIENT
+            .get(script_url.clone())
+            .send()
+            .await
+            .map_err(|e| SessionError::Build {
+                source: e.without_url(),
+            })?;
+        if !response.status().is_success() {
+            return Err(SessionError::RuishuError {
+                msg: format!("failed to fetch site mainjs (HTTP {})", response.status()),
+            });
+        }
+        let source = response.text().await.map_err(|e| SessionError::Build {
+            source: e.without_url(),
+        })?;
+
+        let state = self
+            .ruishu_state
+            .read()
+            .map_err(|_| SessionError::LockError {
+                msg: "ruishu_state read lock poisoned".to_string(),
+            })?;
+        let mut mainjs_guard = self
+            .ruishu_mainjs
+            .write()
+            .map_err(|_| SessionError::LockError {
+                msg: "ruishu_mainjs write lock poisoned".to_string(),
+            })?;
+        if state.mainjs_src.as_ref() == Some(&script_url) {
+            *mainjs_guard = Some(source);
+        }
+        Ok(())
     }
 
     fn refresh_ruishu_cookie(&self, url: &reqwest::Url) -> Result<bool, SessionError> {
@@ -203,6 +349,70 @@ impl Session {
         self.cookie_jar
             .add_cookie_str(&format!("{cookie_t_name}={cookie_t}; Path=/"), url)?;
         Ok(true)
+    }
+
+    fn adopt_challenge_for_response(
+        &self,
+        url: &reqwest::Url,
+        cd: &str,
+        nsd: u32,
+        script_url: Option<reqwest::Url>,
+    ) -> Result<(), SessionError> {
+        let mut state = self
+            .ruishu_state
+            .write()
+            .map_err(|_| SessionError::LockError {
+                msg: "ruishu_state write lock poisoned".to_string(),
+            })?;
+        let target_host = url.host_str().unwrap_or("sso.cqu.edu.cn");
+        let is_host_change = state
+            .active_host
+            .as_deref()
+            .is_some_and(|h| h != target_host);
+        let is_challenge_change = match &state.challenge {
+            Some((current_cd, current_nsd)) => current_cd != cd || *current_nsd != nsd,
+            None => false,
+        };
+        let is_source_change = match (&state.mainjs_src, &script_url) {
+            (Some(curr), Some(new)) => curr != new,
+            _ => false,
+        };
+
+        if is_challenge_change || is_source_change || is_host_change {
+            if state.challenge.is_some() {
+                for name in ["CtLgrmkSWHBZP", "CtLgrmkSWHBZT"] {
+                    self.cookie_jar.remove_cqu_cookie(name)?;
+                }
+                state.basearr = None;
+            }
+            if is_source_change || is_host_change {
+                state.basearr = None;
+                let mut mainjs =
+                    self.ruishu_mainjs
+                        .write()
+                        .map_err(|_| SessionError::LockError {
+                            msg: "ruishu_mainjs write lock poisoned".to_string(),
+                        })?;
+                *mainjs = None;
+            }
+        }
+
+        state.challenge = Some((cd.to_string(), nsd));
+        if let Some(src) = script_url {
+            state.mainjs_src = Some(src);
+        } else if is_host_change {
+            state.mainjs_src = None;
+        }
+        state.active_host = Some(target_host.to_string());
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mainjs_src(&self) -> Option<reqwest::Url> {
+        self.ruishu_state
+            .read()
+            .ok()
+            .and_then(|state| state.mainjs_src.clone())
     }
 
     /// 向会话注入 Cookies（`name=value; name2=value2`），作用域由 `url` 的 host 决定
@@ -318,7 +528,8 @@ impl Session {
 
     /// 从页面 HTML 提取并记录 `$_ts.cd` 与 `$_ts.nsd` 挑战。
     ///
-    /// 挑战变化时清除旧内层密文；随后由 [`Self::set_mainjs`] 提供的脚本重新生成。
+    /// 挑战变化时清除旧内层密文；页面中的外层脚本地址也会被记录，
+    /// 之后缺少 `basearr` 时由 [`Self::execute`] 按需拉取并纯算。
     ///
     /// ```
     /// # use rsmycqu::session::Session;
@@ -327,23 +538,63 @@ impl Session {
     /// assert!(session.set_ruishu_challenge_from_page(page_html));
     /// ```
     pub fn set_ruishu_challenge_from_page(&self, page_html: &str) -> bool {
+        let extracted_src = extract_mainjs_src(page_html);
+        let resolved_src = match extracted_src {
+            Some(src) => {
+                let Ok(sso_base) = reqwest::Url::parse(RUISHU_MAINJS_ROOT) else {
+                    return false;
+                };
+                match resolve_and_validate_script_url(&sso_base, &src) {
+                    Ok(url) => Some(url),
+                    Err(_) => return false,
+                }
+            }
+            None => None,
+        };
+
         match (extract_ts_cd(page_html), extract_ts_nsd(page_html)) {
             (Some(cd), Some(nsd)) => {
                 let Ok(mut state) = self.ruishu_state.write() else {
                     return false;
                 };
-                if let Some((current_cd, current_nsd)) = &state.challenge {
-                    if current_cd == cd && *current_nsd == nsd {
-                        return true;
+                let target_host = "sso.cqu.edu.cn";
+                let is_host_change = state
+                    .active_host
+                    .as_deref()
+                    .is_some_and(|h| h != target_host);
+                let is_challenge_change = match &state.challenge {
+                    Some((current_cd, current_nsd)) => current_cd != cd || *current_nsd != nsd,
+                    None => false,
+                };
+                let is_source_change = match (&state.mainjs_src, &resolved_src) {
+                    (Some(curr), Some(new)) => curr != new,
+                    _ => false,
+                };
+
+                if is_challenge_change || is_source_change || is_host_change {
+                    if state.challenge.is_some() {
+                        for name in ["CtLgrmkSWHBZP", "CtLgrmkSWHBZT"] {
+                            if self.cookie_jar.remove_cqu_cookie(name).is_err() {
+                                return false;
+                            }
+                        }
+                        state.basearr = None;
                     }
-                    for name in ["CtLgrmkSWHBZP", "CtLgrmkSWHBZT"] {
-                        if self.cookie_jar.remove_cqu_cookie(name).is_err() {
-                            return false;
+                    if is_source_change || is_host_change {
+                        state.basearr = None;
+                        if let Ok(mut mainjs) = self.ruishu_mainjs.write() {
+                            *mainjs = None;
                         }
                     }
-                    state.basearr = None;
                 }
+
                 state.challenge = Some((cd.to_string(), nsd));
+                if let Some(src) = resolved_src {
+                    state.mainjs_src = Some(src);
+                } else if is_host_change {
+                    state.mainjs_src = None;
+                }
+                state.active_host = Some(target_host.to_string());
                 true
             }
             _ => false,
@@ -464,6 +715,75 @@ fn extract_ts_cd(html: &str) -> Option<&str> {
         }
     }
     None
+}
+
+static RUISHU_SCRIPT_SELECTOR: LazyLock<Selector> = LazyLock::new(|| {
+    Selector::parse(r#"script[r="m"][src]"#).expect("valid ruishu script selector")
+});
+
+/// 从页面 HTML 提取站点外层脚本（`mainjs`）的 `src`。
+///
+/// 瑞数加载器以 `r='m'` 且具有 `src` 属性标注该脚本。
+pub(crate) fn extract_mainjs_src(html: &str) -> Option<String> {
+    let document = Html::parse_document(html);
+    for element in document.select(&RUISHU_SCRIPT_SELECTOR) {
+        if let Some(src) = element.value().attr("src") {
+            let trimmed = src.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn validate_script_url(url: &reqwest::Url) -> Result<(), SessionError> {
+    if url.scheme() != "https" {
+        return Err(SessionError::RuishuError {
+            msg: "insecure script scheme; only HTTPS is permitted".to_string(),
+        });
+    }
+    match url.host_str() {
+        Some("sso.cqu.edu.cn" | "my.cqu.edu.cn") => {}
+        _ => {
+            return Err(SessionError::RuishuError {
+                msg: "untrusted script host; only sso.cqu.edu.cn and my.cqu.edu.cn are permitted"
+                    .to_string(),
+            });
+        }
+    }
+    if url.port_or_known_default() != Some(443) {
+        return Err(SessionError::RuishuError {
+            msg: "non-standard script port".to_string(),
+        });
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(SessionError::RuishuError {
+            msg: "script URL must not contain user credentials".to_string(),
+        });
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(SessionError::RuishuError {
+            msg: "script URL must not contain query or fragment".to_string(),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn resolve_and_validate_script_url(
+    base_url: &reqwest::Url,
+    src: &str,
+) -> Result<reqwest::Url, SessionError> {
+    let joined = base_url.join(src).map_err(|_| SessionError::RuishuError {
+        msg: "invalid script URL syntax".to_string(),
+    })?;
+    validate_script_url(&joined)?;
+    if joined.origin() != base_url.origin() {
+        return Err(SessionError::RuishuError {
+            msg: "script URL must match the challenge response origin".to_string(),
+        });
+    }
+    Ok(joined)
 }
 
 fn ruishu_cookie_names(url: &reqwest::Url) -> (&'static str, &'static str) {

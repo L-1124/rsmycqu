@@ -156,7 +156,7 @@ async fn test_check_sso_session_server_error_is_http_status() {
 
 #[rstest]
 #[tokio::test]
-async fn test_check_sso_session_waf_412_is_http_status() {
+async fn test_check_sso_session_waf_412_without_challenge_page_is_ruishu_error() {
     let replies = vec![http_reply("412 Precondition Failed", "ruishu block")];
     let session = Session::new();
     let s = &session;
@@ -168,7 +168,9 @@ async fn test_check_sso_session_waf_412_is_http_status() {
 
     assert!(matches!(
         res,
-        Err(ApiError::HttpStatus { status }) if status == StatusCode::PRECONDITION_FAILED
+        Err(ApiError::Session {
+            source: crate::errors::session::SessionError::RuishuError { .. }
+        })
     ));
 }
 

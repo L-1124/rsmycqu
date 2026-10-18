@@ -909,3 +909,360 @@ fn test_session_debug_redacts_secrets() {
     assert!(!debug_str.contains("secret_cd_hash"));
     assert!(!debug_str.contains("eeeeeeee"));
 }
+
+#[test]
+fn extract_mainjs_src_prefers_marked_script() {
+    let html = r#"
+        <script src="/vendor/app.js"></script>
+        <script type="text/javascript" src="/o1wscOsW7WGI/UUezYZrKq3dX.19f0848.js" r='m'></script>
+    "#;
+    assert_eq!(
+        super::extract_mainjs_src(html).as_deref(),
+        Some("/o1wscOsW7WGI/UUezYZrKq3dX.19f0848.js")
+    );
+}
+
+#[test]
+fn extract_mainjs_src_requires_marked_script_no_fallback() {
+    let html =
+        r#"<script src='https://sso.cqu.edu.cn/a/b.js'></script><script src="/c.js"></script>"#;
+    assert_eq!(super::extract_mainjs_src(html), None);
+    assert_eq!(super::extract_mainjs_src("<html></html>"), None);
+}
+
+#[test]
+fn page_challenge_records_mainjs_source() {
+    let session = Session::new();
+    let html = r#"<script src="/o1wscOsW7WGI/main.js" r='m'></script><script>$_ts.cd="cd-1";$_ts.nsd=42;</script>"#;
+    assert!(session.set_ruishu_challenge_from_page(html));
+
+    let recorded = session.mainjs_src();
+    assert_eq!(
+        recorded.as_ref().map(|u| u.as_str()),
+        Some("https://sso.cqu.edu.cn/o1wscOsW7WGI/main.js")
+    );
+    assert!(session.ruishu_mainjs.read().expect("mainjs lock").is_none());
+}
+
+#[test]
+fn test_validate_script_url_origin_boundaries() {
+    let parse = |s: &str| reqwest::Url::parse(s).unwrap();
+
+    assert!(
+        super::validate_script_url(&parse(
+            "https://sso.cqu.edu.cn/o1wscOsW7WGI/UUezYZrKq3dX.19f0848.js"
+        ))
+        .is_ok()
+    );
+    assert!(
+        super::validate_script_url(&parse(
+            "https://my.cqu.edu.cn/o1wscOsW7WGI/3LUNfBL1Sj60.19f0848.js"
+        ))
+        .is_ok()
+    );
+    assert!(
+        super::validate_script_url(&parse("https://sso.cqu.edu.cn:443/static/main.js")).is_ok()
+    );
+
+    assert!(matches!(
+        super::validate_script_url(&parse("http://sso.cqu.edu.cn/static/main.js")),
+        Err(super::SessionError::RuishuError { .. })
+    ));
+    assert!(matches!(
+        super::validate_script_url(&parse("https://evil.cqu.edu.cn/main.js")),
+        Err(super::SessionError::RuishuError { .. })
+    ));
+    assert!(matches!(
+        super::validate_script_url(&parse("https://card.cqu.edu.cn/main.js")),
+        Err(super::SessionError::RuishuError { .. })
+    ));
+    assert!(matches!(
+        super::validate_script_url(&parse("https://example.com/main.js")),
+        Err(super::SessionError::RuishuError { .. })
+    ));
+    assert!(matches!(
+        super::validate_script_url(&parse("https://sso.cqu.edu.cn:8443/main.js")),
+        Err(super::SessionError::RuishuError { .. })
+    ));
+    assert!(matches!(
+        super::validate_script_url(&parse("https://admin:pass@sso.cqu.edu.cn/main.js")),
+        Err(super::SessionError::RuishuError { .. })
+    ));
+    assert!(matches!(
+        super::validate_script_url(&parse("https://sso.cqu.edu.cn/main.js?token=secret")),
+        Err(super::SessionError::RuishuError { .. })
+    ));
+    assert!(matches!(
+        super::validate_script_url(&parse("https://sso.cqu.edu.cn/main.js#frag")),
+        Err(super::SessionError::RuishuError { .. })
+    ));
+}
+
+#[rstest::rstest]
+#[case("/site.js", true)]
+#[case("https://sso.cqu.edu.cn/site.js", true)]
+#[case("//my.cqu.edu.cn/site.js", false)]
+#[case("https://my.cqu.edu.cn/site.js", false)]
+#[case("https://foreign.example/site.js", false)]
+fn script_source_cannot_escape_challenge_origin(#[case] src: &str, #[case] accepted: bool) {
+    let base = reqwest::Url::parse("https://sso.cqu.edu.cn/login").unwrap();
+    assert_eq!(
+        super::resolve_and_validate_script_url(&base, src).is_ok(),
+        accepted
+    );
+}
+
+#[test]
+fn test_extract_mainjs_src_data_src_and_attributes() {
+    let html_data_src = r#"<script data-src="/fake.js" r="m"></script>"#;
+    assert_eq!(super::extract_mainjs_src(html_data_src), None);
+
+    let html_data_r = r#"<script src="/other.js" data-r="m"></script>"#;
+    assert_eq!(super::extract_mainjs_src(html_data_r), None);
+
+    let html_inline_r = r#"<script r="m">window._$ts = {};</script>"#;
+    assert_eq!(super::extract_mainjs_src(html_inline_r), None);
+
+    let html_vendor = r#"<script src="/vendor/chunk.js"></script>"#;
+    assert_eq!(super::extract_mainjs_src(html_vendor), None);
+
+    let html_mixed = r#"
+        <script src="/vendor/lib.js"></script>
+        <script r="m">/* inline ruishu bootstrap */</script>
+        <script type="text/javascript" src="/o1wscOsW7WGI/UUezYZrKq3dX.19f0848.js" r='m'></script>
+    "#;
+    assert_eq!(
+        super::extract_mainjs_src(html_mixed).as_deref(),
+        Some("/o1wscOsW7WGI/UUezYZrKq3dX.19f0848.js")
+    );
+}
+
+#[test]
+fn test_cache_invalidation_on_source_change() {
+    let session = Session::new();
+    let sso_html = r#"<script src="/o1wscOsW7WGI/sso.js" r='m'></script><script>$_ts.cd="cd_sso";$_ts.nsd=1111;</script>"#;
+    assert!(session.set_ruishu_challenge_from_page(sso_html));
+    session.set_mainjs("/* sso script */");
+    session.set_basearr(&[0x11; 160]).unwrap();
+    session
+        .set_ruishu_cookies("https://sso.cqu.edu.cn/", "server_o", "client_t")
+        .unwrap();
+
+    assert!(session.basearr().is_some());
+    assert!(session.ruishu_mainjs.read().unwrap().is_some());
+
+    let my_url = reqwest::Url::parse("https://my.cqu.edu.cn/authserver/simple-user").unwrap();
+    let my_script = super::resolve_and_validate_script_url(&my_url, "/o1wscOsW7WGI/my.js").unwrap();
+    session
+        .adopt_challenge_for_response(&my_url, "cd_my", 2222, Some(my_script))
+        .unwrap();
+
+    assert_eq!(session.basearr(), None);
+    assert!(session.ruishu_mainjs.read().unwrap().is_none());
+
+    let cookies = session.cookies("https://sso.cqu.edu.cn/").unwrap().unwrap();
+    assert!(cookies.contains("CtLgrmkSWHBZO=server_o"));
+    assert!(!cookies.contains("CtLgrmkSWHBZP="));
+}
+
+#[test]
+fn test_initial_challenge_preserves_injected_basearr() {
+    let session = Session::new();
+    let sample = [0x77u8; 160];
+    session.set_basearr(&sample).unwrap();
+
+    let html = r#"<script>$_ts.cd="initial_cd";$_ts.nsd=3333;</script>"#;
+    assert!(session.set_ruishu_challenge_from_page(html));
+    assert_eq!(session.basearr().as_deref(), Some(&sample[..]));
+}
+
+#[rstest::rstest]
+fn test_snapshot_rejects_unsafe_script_urls() {
+    let base_snap = Session::new().export_snapshot().unwrap();
+
+    let mut bad_host: serde_json::Value = serde_json::from_str(&base_snap).unwrap();
+    bad_host["ruishu"]["mainjs_src"] = "https://evil.com/malicious.js".into();
+    assert!(matches!(
+        Session::from_snapshot(&bad_host.to_string()),
+        Err(super::SessionError::SnapshotError { .. })
+    ));
+
+    let mut bad_scheme: serde_json::Value = serde_json::from_str(&base_snap).unwrap();
+    bad_scheme["ruishu"]["mainjs_src"] = "http://sso.cqu.edu.cn/main.js".into();
+    assert!(matches!(
+        Session::from_snapshot(&bad_scheme.to_string()),
+        Err(super::SessionError::SnapshotError { .. })
+    ));
+
+    let mut bad_cred: serde_json::Value = serde_json::from_str(&base_snap).unwrap();
+    bad_cred["ruishu"]["mainjs_src"] = "https://attacker:pass@sso.cqu.edu.cn/main.js".into();
+    assert!(matches!(
+        Session::from_snapshot(&bad_cred.to_string()),
+        Err(super::SessionError::SnapshotError { .. })
+    ));
+
+    let mut bad_query: serde_json::Value = serde_json::from_str(&base_snap).unwrap();
+    bad_query["ruishu"]["mainjs_src"] = "https://sso.cqu.edu.cn/main.js?token=leak".into();
+    assert!(matches!(
+        Session::from_snapshot(&bad_query.to_string()),
+        Err(super::SessionError::SnapshotError { .. })
+    ));
+}
+
+#[rstest::rstest]
+fn test_snapshot_resolves_legacy_relative_mainjs_src() {
+    let base_snap = Session::new().export_snapshot().unwrap();
+    let mut legacy: serde_json::Value = serde_json::from_str(&base_snap).unwrap();
+    legacy["ruishu"]["mainjs_src"] = "/o1wscOsW7WGI/UUezYZrKq3dX.19f0848.js".into();
+    legacy["ruishu"]["challenge"] = serde_json::json!({
+        "cd": "legacy_cd",
+        "nsd": 5555
+    });
+
+    let restored = Session::from_snapshot(&legacy.to_string()).unwrap();
+    assert_eq!(
+        restored.mainjs_src().as_ref().map(|u| u.as_str()),
+        Some("https://sso.cqu.edu.cn/o1wscOsW7WGI/UUezYZrKq3dX.19f0848.js")
+    );
+}
+
+#[rstest::rstest]
+#[tokio::test]
+async fn test_execute_only_one_412_retry() {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        time::Duration,
+    };
+
+    let fixtures: serde_json::Value =
+        serde_json::from_str(include_str!("../../tests/fixtures/ruishu_sessions.json")).unwrap();
+    let initial_cookie_t = fixtures["session_1"]["cookie_t"].as_str().unwrap();
+
+    let coder: serde_json::Value =
+        serde_json::from_str(include_str!("../../tests/fixtures/ruishu_coder.json")).unwrap();
+    let vector = &coder["vectors"]["session_1"];
+    let cd = vector["cd"].as_str().unwrap().to_string();
+    let nsd = vector["nsd"].as_u64().unwrap() as u32;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let server_cd = cd.clone();
+    let server = std::thread::spawn(move || {
+        let mut request_count = 0;
+        let mut received_cookie_ts = Vec::new();
+        while let Ok((mut stream, _)) = listener.accept() {
+            stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let mut buf = [0u8; 2048];
+            let len = stream.read(&mut buf).unwrap_or(0);
+            let req_str = String::from_utf8_lossy(&buf[..len]);
+            if let Some(cookie_line) = req_str
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("cookie:"))
+            {
+                let ct = cookie_line
+                    .split_once(':')
+                    .unwrap()
+                    .1
+                    .split(';')
+                    .find_map(|p| p.trim().strip_prefix("CtLgrmkSWHBZP="))
+                    .map(|s| s.to_string());
+                received_cookie_ts.push(ct);
+            }
+            request_count += 1;
+            let response = format!(
+                "HTTP/1.1 412 Precondition Failed\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<script>$_ts.cd=\"{server_cd}\";$_ts.nsd={nsd};</script>"
+            );
+            let _ = stream.write_all(response.as_bytes());
+            if request_count >= 2 {
+                break;
+            }
+        }
+        (request_count, received_cookie_ts)
+    });
+
+    let session = Session::new();
+    session.set_basearr_from_cookie(initial_cookie_t).unwrap();
+    assert!(session.set_ruishu_challenge_from_page(&format!("$_ts.cd=\"{cd}\";$_ts.nsd={nsd};")));
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .resolve("sso.cqu.edu.cn", address)
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+
+    let res = session
+        .execute(client.get(format!(
+            "http://sso.cqu.edu.cn:{}/api/protected/test",
+            address.port()
+        )))
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), reqwest::StatusCode::PRECONDITION_FAILED);
+    let (count, cookie_ts) = server.join().unwrap();
+    assert_eq!(count, 2, "must perform exactly one retry on 412");
+    assert_eq!(cookie_ts.len(), 2);
+    assert!(cookie_ts[0].is_some(), "first request had initial Cookie T");
+    assert!(
+        cookie_ts[1].is_some(),
+        "second request had regenerated Cookie T"
+    );
+    assert_ne!(
+        cookie_ts[0], cookie_ts[1],
+        "retry must generate a new Cookie T"
+    );
+}
+
+#[rstest::rstest]
+#[tokio::test]
+async fn test_execute_malformed_412_rejects_without_replay() {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        time::Duration,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let server = std::thread::spawn(move || {
+        let mut request_count = 0;
+        if let Ok((mut stream, _)) = listener.accept() {
+            stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            request_count += 1;
+            let response = b"HTTP/1.1 412 Precondition Failed\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<script>$_ts.cd=\"corrupted_cd\";</script>";
+            let _ = stream.write_all(response);
+        }
+        request_count
+    });
+
+    let session = Session::new();
+    assert!(session.set_ruishu_challenge_from_page("$_ts.cd=\"old_cd\";$_ts.nsd=1234;"));
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .resolve("sso.cqu.edu.cn", address)
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+
+    let res = session
+        .execute(client.get(format!("http://sso.cqu.edu.cn:{}/login", address.port())))
+        .await;
+
+    assert!(matches!(res, Err(super::SessionError::RuishuError { .. })));
+    let count = server.join().unwrap();
+    assert_eq!(
+        count, 1,
+        "must not retry when 412 carries a malformed challenge"
+    );
+}

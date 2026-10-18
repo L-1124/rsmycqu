@@ -1066,8 +1066,8 @@ async fn test_send_second_factor_code_error_responses() {
     .await;
     assert!(matches!(
         res3,
-        Err(ApiError::Inner {
-            source: SSOError::RuishuError { .. }
+        Err(ApiError::Session {
+            source: crate::errors::session::SessionError::RuishuError { .. }
         })
     ));
 }
