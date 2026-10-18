@@ -3,12 +3,13 @@ use rstest::rstest;
 
 use reqwest::Url;
 
+use super::redirect_summary;
 use crate::{
-    errors::{ApiError, sso::SSOError},
+    errors::{ApiError, session::SessionError, sso::SSOError},
     session::Session,
     sso::{
         check_sso_session,
-        status::{SsoSessionStatus, is_exact_cas_success_callback, validate_login_redirect},
+        status::{SsoSessionStatus, is_cas_success_callback, validate_login_redirect},
         tests::{http_redirect, http_reply, run_test_tls_server},
     },
 };
@@ -169,7 +170,7 @@ async fn test_check_sso_session_waf_412_without_challenge_page_is_ruishu_error()
     assert!(matches!(
         res,
         Err(ApiError::Session {
-            source: crate::errors::session::SessionError::RuishuError { .. }
+            source: SessionError::RuishuError { .. }
         })
     ));
 }
@@ -329,7 +330,46 @@ async fn test_check_sso_session_unresolved_redirect_is_not_authenticated() {
 #[case::same_origin_explicit_port("https://sso.cqu.edu.cn:443/authserver/index.do", true)]
 #[case::exact_cas_success_callback("https://self.cqu.edu.cn/cas-success", true)]
 #[case::exact_cas_success_callback_explicit_port("https://self.cqu.edu.cn:443/cas-success", true)]
-#[case::cas_callback_with_query("https://self.cqu.edu.cn/cas-success?ticket=ST-123456", false)]
+#[case::cas_callback_with_ticket("https://self.cqu.edu.cn/cas-success?ticket=ST-123456", true)]
+#[case::cas_callback_with_opaque_ticket(
+    "https://self.cqu.edu.cn/cas-success?ticket=custom_opaque_ticket_xyz",
+    true
+)]
+#[case::cas_callback_with_encoded_amp_ticket(
+    "https://self.cqu.edu.cn/cas-success?ticket=token%26param",
+    true
+)]
+#[case::cas_callback_with_empty_ticket("https://self.cqu.edu.cn/cas-success?ticket=", false)]
+#[case::cas_callback_with_empty_query("https://self.cqu.edu.cn/cas-success?", false)]
+#[case::cas_callback_with_duplicate_ticket(
+    "https://self.cqu.edu.cn/cas-success?ticket=ST-1&ticket=ST-2",
+    false
+)]
+#[case::cas_callback_with_ticket_and_extra_query(
+    "https://self.cqu.edu.cn/cas-success?ticket=ST-1&next=/evil",
+    false
+)]
+#[case::cas_callback_with_ticket_and_fragment(
+    "https://self.cqu.edu.cn/cas-success?ticket=ST-1#token",
+    false
+)]
+#[case::cas_callback_with_ticket_and_trailing_amp(
+    "https://self.cqu.edu.cn/cas-success?ticket=ST-1&",
+    false
+)]
+#[case::cas_callback_with_ticket_user_pass(
+    "https://user:pass@self.cqu.edu.cn/cas-success?ticket=ST-1",
+    false
+)]
+#[case::cas_callback_with_ticket_alt_port(
+    "https://self.cqu.edu.cn:8443/cas-success?ticket=ST-1",
+    false
+)]
+#[case::cas_callback_with_ticket_http_downgrade(
+    "http://self.cqu.edu.cn/cas-success?ticket=ST-1",
+    false
+)]
+#[case::cas_callback_with_other_query("https://self.cqu.edu.cn/cas-success?next=/evil", false)]
 #[case::cas_callback_with_fragment("https://self.cqu.edu.cn/cas-success#token", false)]
 #[case::cas_callback_with_trailing_slash("https://self.cqu.edu.cn/cas-success/", false)]
 #[case::cas_callback_other_path("https://self.cqu.edu.cn/login", false)]
@@ -358,14 +398,31 @@ fn test_validate_login_redirect_boundaries(#[case] target_str: &str, #[case] sho
 #[rstest]
 #[case::exact_target("https://self.cqu.edu.cn/cas-success", true)]
 #[case::explicit_port_target("https://self.cqu.edu.cn:443/cas-success", true)]
-#[case::with_query("https://self.cqu.edu.cn/cas-success?query=1", false)]
+#[case::with_ticket("https://self.cqu.edu.cn/cas-success?ticket=ST-1", true)]
+#[case::with_opaque_ticket(
+    "https://self.cqu.edu.cn/cas-success?ticket=opaque_token_without_prefix",
+    true
+)]
+#[case::with_encoded_amp_ticket("https://self.cqu.edu.cn/cas-success?ticket=token%26param", true)]
+#[case::with_empty_ticket("https://self.cqu.edu.cn/cas-success?ticket=", false)]
+#[case::with_empty_query("https://self.cqu.edu.cn/cas-success?", false)]
+#[case::with_duplicate_ticket("https://self.cqu.edu.cn/cas-success?ticket=ST-1&ticket=ST-2", false)]
+#[case::with_ticket_trailing_amp("https://self.cqu.edu.cn/cas-success?ticket=ST-1&", false)]
+#[case::with_ticket_leading_amp("https://self.cqu.edu.cn/cas-success?&ticket=ST-1", false)]
+#[case::with_ticket_and_fragment("https://self.cqu.edu.cn/cas-success?ticket=ST-1#token", false)]
+#[case::subdomain_with_ticket("https://fake.self.cqu.edu.cn/cas-success?ticket=ST-1", false)]
+#[case::scheme_http_with_ticket("http://self.cqu.edu.cn/cas-success?ticket=ST-1", false)]
+#[case::alt_port_with_ticket("https://self.cqu.edu.cn:8443/cas-success?ticket=ST-1", false)]
+#[case::user_pass_with_ticket("https://user:pass@self.cqu.edu.cn/cas-success?ticket=ST-1", false)]
+#[case::with_other_query("https://self.cqu.edu.cn/cas-success?query=1", false)]
+#[case::with_extra_query("https://self.cqu.edu.cn/cas-success?ticket=ST-1&next=/evil", false)]
 #[case::with_fragment("https://self.cqu.edu.cn/cas-success#frag", false)]
 #[case::wrong_path("https://self.cqu.edu.cn/cas-success-fake", false)]
 #[case::subdomain("https://fake.self.cqu.edu.cn/cas-success", false)]
 #[case::scheme_http("http://self.cqu.edu.cn/cas-success", false)]
-fn test_is_exact_cas_success_callback(#[case] target_str: &str, #[case] expected: bool) {
+fn test_is_cas_success_callback(#[case] target_str: &str, #[case] expected: bool) {
     let target = Url::parse(target_str).unwrap();
-    assert_eq!(is_exact_cas_success_callback(&target), expected);
+    assert_eq!(is_cas_success_callback(&target), expected);
 }
 
 #[rstest]
@@ -407,5 +464,132 @@ async fn test_check_sso_session_exact_cas_success_callback_unauthenticated_if_co
     .await;
 
     assert_eq!(res.unwrap(), SsoSessionStatus::Unauthenticated);
+    assert_eq!(requests.len(), 2);
+}
+
+#[rstest]
+#[case::standard_origin_no_query(
+    "https://evil.cqu.com/secret/path/token-12345",
+    "https://evil.cqu.com"
+)]
+#[case::standard_origin_single_query(
+    "https://evil.cqu.com/sensitive/api?secret_token=abc",
+    "https://evil.cqu.com?[query: 1]"
+)]
+#[case::standard_origin_multiple_query(
+    "https://attacker.com/v1/auth?api_key=secret&user_pass=pass123&third=value",
+    "https://attacker.com?[query: 3]"
+)]
+#[case::alt_port_no_query("https://evil.cqu.com:8443/secret/path", "https://evil.cqu.com:8443")]
+#[case::alt_port_with_query(
+    "https://evil.cqu.com:8443/steal?t=1&s=2",
+    "https://evil.cqu.com:8443?[query: 2]"
+)]
+#[case::http_scheme_no_query("http://evil.cqu.com/path", "http://evil.cqu.com")]
+#[case::http_alt_port(
+    "http://evil.cqu.com:8080/path?key=val",
+    "http://evil.cqu.com:8080?[query: 1]"
+)]
+#[case::credentials_redacted(
+    "https://user:secret_pass@evil.cqu.com/leak_endpoint?token=abc",
+    "https://evil.cqu.com?[query: 1]"
+)]
+fn test_redirect_summary_redaction(#[case] target_str: &str, #[case] expected_summary: &str) {
+    let target = Url::parse(target_str).unwrap();
+    let summary = redirect_summary(&target);
+    assert_eq!(summary, expected_summary);
+}
+
+#[rstest]
+fn test_validate_login_redirect_error_redacts_sensitive_path_and_query() {
+    let base = Url::parse("https://sso.cqu.edu.cn/authserver/login").unwrap();
+    let target = Url::parse(
+        "https://attacker.com/oauth2/token/SUPER_SECRET_PATH_TOKEN_99999?SECRET_KEY=VAL_12345&ANOTHER_SECRET_KEY=VAL_67890",
+    )
+    .unwrap();
+
+    let err = validate_login_redirect(&base, &target).unwrap_err();
+    let msg = match err {
+        ApiError::Website { msg } => msg,
+        other => panic!("expected ApiError::Website, got: {other:?}"),
+    };
+
+    assert!(
+        !msg.contains("SUPER_SECRET_PATH_TOKEN_99999"),
+        "leaked secret path token in: {msg}"
+    );
+    assert!(!msg.contains("/oauth2/token/"), "leaked path in: {msg}");
+    assert!(
+        !msg.contains("SECRET_KEY"),
+        "leaked secret query key in: {msg}"
+    );
+    assert!(
+        !msg.contains("VAL_12345"),
+        "leaked secret query value in: {msg}"
+    );
+    assert!(
+        !msg.contains("ANOTHER_SECRET_KEY"),
+        "leaked second secret query key in: {msg}"
+    );
+    assert!(
+        !msg.contains("VAL_67890"),
+        "leaked second secret query value in: {msg}"
+    );
+
+    assert_eq!(
+        msg,
+        "SSO redirect rejected: cross-origin redirect to https://attacker.com?[query: 2]"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_check_sso_session_cross_origin_redirect_diagnostics_redacted() {
+    let replies = vec![http_redirect(
+        "https://evil.cqu.com/secret/path/victim_token?api_secret=leaked_val&client_secret=leaked_key",
+    )];
+    let session = Session::new();
+    let s = &session;
+
+    let (res, _) = run_test_tls_server(replies, |client| async move {
+        check_sso_session(&client, s).await
+    })
+    .await;
+
+    match res {
+        Err(ApiError::Website { msg }) => {
+            assert!(
+                !msg.contains("secret/path/victim_token"),
+                "leaked path in: {msg}"
+            );
+            assert!(!msg.contains("api_secret"), "leaked query key in: {msg}");
+            assert!(!msg.contains("leaked_val"), "leaked query value in: {msg}");
+            assert!(!msg.contains("client_secret"), "leaked query key in: {msg}");
+            assert!(!msg.contains("leaked_key"), "leaked query value in: {msg}");
+            assert!(
+                msg.contains("https://evil.cqu.com?[query: 2]"),
+                "expected redacted origin and count, got: {msg}"
+            );
+        }
+        other => panic!("expected ApiError::Website with redacted diagnostics, got: {other:?}"),
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_check_sso_session_cas_success_callback_with_ticket_authenticated() {
+    let replies = vec![
+        http_redirect("https://self.cqu.edu.cn/cas-success?ticket=ST-998877"),
+        http_redirect("https://self.cqu.edu.cn/cas-success?ticket=ST-998877"),
+    ];
+    let session = Session::new();
+    let s = &session;
+
+    let (res, requests) = run_test_tls_server(replies, |client| async move {
+        check_sso_session(&client, s).await
+    })
+    .await;
+
+    assert_eq!(res.unwrap(), SsoSessionStatus::Authenticated);
     assert_eq!(requests.len(), 2);
 }

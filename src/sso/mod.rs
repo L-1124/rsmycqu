@@ -334,7 +334,7 @@ pub(crate) async fn handle_login_response_internal(
             })?;
             status::validate_login_redirect(res.url(), &url)?;
 
-            if status::is_exact_cas_success_callback(&url) {
+            if status::is_cas_success_callback(&url) {
                 let confirmation = session.execute(client.get(SSO_LOGIN_URL)).await?;
                 match confirmation.status() {
                     StatusCode::FOUND => {
@@ -348,7 +348,7 @@ pub(crate) async fn handle_login_response_internal(
                             })?;
                         status::validate_login_redirect(confirmation.url(), &confirm_target)?;
                         ensure!(
-                            status::is_exact_cas_success_callback(&confirm_target),
+                            status::is_cas_success_callback(&confirm_target),
                             errors::WebsiteSnafu {
                                 msg: "Login confirmation redirected to unexpected target",
                             }
@@ -393,7 +393,7 @@ pub(crate) async fn handle_login_response_internal(
                     }
                 );
                 status::validate_login_redirect(landing.url(), &url2)?;
-                if !status::is_exact_cas_success_callback(&url2) {
+                if !status::is_cas_success_callback(&url2) {
                     let second_landing = session.execute(client.get(url2)).await?;
                     if second_landing.status().is_success() {
                         let html = second_landing.text().await?;

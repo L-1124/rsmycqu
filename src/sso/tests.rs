@@ -1710,7 +1710,7 @@ async fn test_submit_second_factor_trusted_self_callback_success() {
 #[case::http_downgrade("http://self.cqu.edu.cn/cas-success")]
 #[case::alt_port("https://self.cqu.edu.cn:8443/cas-success")]
 #[case::embedded_credentials("https://user:pass@self.cqu.edu.cn/cas-success")]
-#[case::callback_with_query("https://self.cqu.edu.cn/cas-success?ticket=st123")]
+#[case::callback_with_other_query("https://self.cqu.edu.cn/cas-success?next=/evil")]
 #[case::callback_with_fragment("https://self.cqu.edu.cn/cas-success#fragment")]
 #[case::callback_wrong_path("https://self.cqu.edu.cn/other")]
 #[case::subdomain_spoof("https://self.cqu.edu.cn.attacker.com/cas-success")]
