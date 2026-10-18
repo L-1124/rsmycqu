@@ -26,3 +26,18 @@ pub struct AccessInfos {
     #[cfg(feature = "card")]
     pub(crate) card_access_info: Option<CardAccessInfo>,
 }
+
+impl AccessInfos {
+    /// 检查是否没有任何登录服务信息
+    pub fn is_empty(&self) -> bool {
+        #[cfg(feature = "mycqu")]
+        if self.mycqu_access_info.is_some() {
+            return false;
+        }
+        #[cfg(feature = "card")]
+        if self.card_access_info.is_some() {
+            return false;
+        }
+        true
+    }
+}

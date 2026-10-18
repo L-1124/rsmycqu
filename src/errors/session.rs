@@ -20,4 +20,32 @@ pub enum SessionError {
         /// 错误原因描述
         msg: String,
     },
+
+    /// 会话内部状态锁已损坏
+    #[snafu(display("Lock error: {msg}"))]
+    LockError {
+        /// 错误原因描述
+        msg: String,
+    },
+
+    /// 快照格式错误、损坏或截断
+    #[snafu(display("Snapshot error: {msg}"))]
+    SnapshotError {
+        /// 错误描述
+        msg: String,
+    },
+
+    /// 快照版本不支持
+    #[snafu(display("Unsupported snapshot version: {version}"))]
+    UnsupportedVersion {
+        /// 版本号
+        version: u32,
+    },
+
+    /// 快照所需的特性在当前构建中缺失
+    #[snafu(display("Feature mismatch: {msg}"))]
+    FeatureMismatch {
+        /// 缺失特性描述
+        msg: String,
+    },
 }

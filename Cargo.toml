@@ -23,6 +23,7 @@ blocking = ["reqwest/blocking"]
 
 [dependencies]
 reqwest = { version = "0.13.1", features = ["json", "cookies", "query", "form"] }
+cookie_store = "0.22.1"
 base64 = { version = "0.22.0" }
 block-padding = { version = "0.4.2" }
 ecb = "0.2.0"
@@ -36,6 +37,7 @@ serde_json = { version = "1.0.138" }
 const_format = "0.2.34"
 hex = "0.4.3"
 md-5 = "0.10.6"
+
 [dev-dependencies]
 tokio = { version = "1.43.0", features = ["rt", "macros", "rt-multi-thread"] }
 rstest = "0.26.1"

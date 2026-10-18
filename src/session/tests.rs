@@ -406,6 +406,7 @@ fn unchanged_or_invalid_challenge_preserves_inner_cipher() {
     let session = Session::new();
     assert!(session.set_ruishu_challenge_from_page("$_ts.cd=\"first\";$_ts.nsd=1;"));
     session.set_basearr(&[0x5a; 160]).unwrap();
+    assert!(session.set_ruishu_challenge_from_page("$_ts.cd=\"first\";$_ts.nsd=1;"));
     assert_eq!(session.basearr().as_deref(), Some(&[0x5a; 160][..]));
     assert!(!session.set_ruishu_challenge_from_page("$_ts.cd=\"second\";"));
     assert_eq!(session.basearr().as_deref(), Some(&[0x5a; 160][..]));
@@ -483,4 +484,299 @@ fn test_session_set_basearr_rejects_invalid_lengths() {
             .set_basearr(&vec![0u8; super::ruishu::MAX_BASEARR_LEN + 1])
             .is_err()
     );
+}
+
+#[rstest::rstest]
+fn test_snapshot_roundtrip_scope_and_attributes() {
+    let session = Session::new();
+    // 1. Host-only cookie: 无 Domain 属性，作用域限定于 host 本身
+    session
+        .set_cookies("https://sso.cqu.edu.cn/api/test", "host_only=val1")
+        .unwrap();
+    // 2. 泛域名 + Path + Secure + HttpOnly cookie
+    session
+        .cookie_jar
+        .add_cookie_str(
+            "dom_cookie=val2; Domain=cqu.edu.cn; Path=/api; Secure; HttpOnly",
+            &reqwest::Url::parse("https://sso.cqu.edu.cn/api/test").unwrap(),
+        )
+        .unwrap();
+    // 3. 限定深层路径 cookie
+    session
+        .cookie_jar
+        .add_cookie_str(
+            "path_cookie=val3; Path=/api/protected",
+            &reqwest::Url::parse("https://sso.cqu.edu.cn/api/protected").unwrap(),
+        )
+        .unwrap();
+
+    let snapshot = session.export_snapshot().unwrap();
+    let restored = Session::from_snapshot(&snapshot).unwrap();
+
+    // 匹配 /api/protected 的 HTTPS 请求应当收到所有三条 cookie
+    let cookies_all = restored
+        .cookies("https://sso.cqu.edu.cn/api/protected")
+        .unwrap()
+        .unwrap();
+    assert!(cookies_all.contains("host_only=val1"));
+    assert!(cookies_all.contains("dom_cookie=val2"));
+    assert!(cookies_all.contains("path_cookie=val3"));
+
+    // 访问 /api/other 时不应携带 /api/protected 限定的 cookie
+    let cookies_other = restored
+        .cookies("https://sso.cqu.edu.cn/api/other")
+        .unwrap()
+        .unwrap();
+    assert!(cookies_other.contains("host_only=val1"));
+    assert!(cookies_other.contains("dom_cookie=val2"));
+    assert!(!cookies_other.contains("path_cookie=val3"));
+
+    // 跨子域名访问 my.cqu.edu.cn/api/test：Domain=cqu.edu.cn 应匹配，但 host_only 不应匹配
+    let cookies_sub = restored
+        .cookies("https://my.cqu.edu.cn/api/test")
+        .unwrap()
+        .unwrap();
+    assert!(cookies_sub.contains("dom_cookie=val2"));
+    assert!(!cookies_sub.contains("host_only=val1"));
+
+    // 非安全明文 HTTP 请求不应匹配带有 Secure 属性的 cookie
+    let cookies_http = restored.cookies("http://sso.cqu.edu.cn/api/test").unwrap();
+    assert!(cookies_http.is_none_or(|c| !c.contains("dom_cookie=val2")));
+
+    // 其它域名完全不匹配
+    assert_eq!(
+        restored.cookies("https://example.com/api/test").unwrap(),
+        None
+    );
+}
+
+#[rstest::rstest]
+fn test_snapshot_drops_expired_cookies_and_preserves_session_cookies() {
+    let session = Session::new();
+    // 会话 Cookie（无 Expiration / Max-Age）
+    session
+        .cookie_jar
+        .add_cookie_str(
+            "sess_cookie=persistent_in_session; Path=/",
+            &reqwest::Url::parse("https://sso.cqu.edu.cn/").unwrap(),
+        )
+        .unwrap();
+    // 未来有效 Cookie
+    session
+        .cookie_jar
+        .add_cookie_str(
+            "future_cookie=future_val; Path=/; Max-Age=3600",
+            &reqwest::Url::parse("https://sso.cqu.edu.cn/").unwrap(),
+        )
+        .unwrap();
+    // 已过期 Cookie（Max-Age=0）
+    session
+        .cookie_jar
+        .add_cookie_str(
+            "expired_cookie=dead_val; Path=/; Max-Age=0",
+            &reqwest::Url::parse("https://sso.cqu.edu.cn/").unwrap(),
+        )
+        .unwrap();
+
+    let snapshot = session.export_snapshot().unwrap();
+    // 导出的快照 JSON 不应包含已过期的 cookie 内容
+    assert!(snapshot.contains("sess_cookie"));
+    assert!(snapshot.contains("future_cookie"));
+    assert!(!snapshot.contains("expired_cookie"));
+
+    // 恢复会话，验证会话 cookie 与未来 cookie 依然有效
+    let restored = Session::from_snapshot(&snapshot).unwrap();
+    let cookies = restored
+        .cookies("https://sso.cqu.edu.cn/")
+        .unwrap()
+        .unwrap();
+    assert!(cookies.contains("sess_cookie=persistent_in_session"));
+    assert!(cookies.contains("future_cookie=future_val"));
+    assert!(!cookies.contains("expired_cookie"));
+
+    // 即使有人篡改 JSON 注入包含过去 UTC 时间的 cookie，恢复时也必须被严格丢弃
+    let tampered_json = snapshot.replace(
+        "\"cookies\":[",
+        r#""cookies":[{"raw_cookie":"tampered_expired=bad; Path=/","path":["/",true],"domain":{"HostOnly":"sso.cqu.edu.cn"},"expires":{"AtUtc":"2000-01-01T00:00:00Z"}},"#,
+    );
+    let restored_tampered = Session::from_snapshot(&tampered_json).unwrap();
+    let cookies_tampered = restored_tampered
+        .cookies("https://sso.cqu.edu.cn/")
+        .unwrap()
+        .unwrap();
+    assert!(!cookies_tampered.contains("tampered_expired"));
+}
+
+#[rstest::rstest]
+fn test_snapshot_rejects_corrupted_payloads_without_secret_leak() {
+    // 1. 截断的 JSON
+    let err = Session::from_snapshot("{\"version\":1,\"features\":[\"sso\"").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::errors::session::SessionError::SnapshotError { .. }
+    ));
+    let err_str = format!("{err}");
+    assert!(!err_str.contains("sso")); // 不泄露载荷内容
+
+    // 2. basearr hex 非法字符
+    let mut corrupted: serde_json::Value =
+        serde_json::from_str(&Session::new().export_snapshot().unwrap()).unwrap();
+    corrupted["ruishu"]["basearr"] = "not_hex_chars_at_all_here_12345!".into();
+    let err_hex = Session::from_snapshot(&corrupted.to_string()).unwrap_err();
+    assert!(matches!(
+        err_hex,
+        crate::errors::session::SessionError::SnapshotError { .. }
+    ));
+    assert!(!format!("{err_hex}").contains("not_hex_chars"));
+
+    // 3. basearr 长度非法（如 159 字节而非 160 字节）
+    let bad_len_hex = "aa".repeat(159);
+    corrupted["ruishu"]["basearr"] = bad_len_hex.clone().into();
+    let err_len = Session::from_snapshot(&corrupted.to_string()).unwrap_err();
+    assert!(matches!(
+        err_len,
+        crate::errors::session::SessionError::SnapshotError { .. }
+    ));
+    assert!(!format!("{err_len}").contains(&bad_len_hex)); // 绝不打印 hex 载荷明文
+}
+
+#[rstest::rstest]
+fn test_snapshot_rejects_unsupported_version() {
+    let snapshot = Session::new().export_snapshot().unwrap();
+    let v2_snapshot = snapshot.replace("\"version\":1", "\"version\":2");
+    let err = Session::from_snapshot(&v2_snapshot).unwrap_err();
+    assert!(matches!(
+        err,
+        crate::errors::session::SessionError::UnsupportedVersion { version: 2 }
+    ));
+
+    let v0_snapshot = snapshot.replace("\"version\":1", "\"version\":0");
+    let err0 = Session::from_snapshot(&v0_snapshot).unwrap_err();
+    assert!(matches!(
+        err0,
+        crate::errors::session::SessionError::UnsupportedVersion { version: 0 }
+    ));
+}
+
+#[rstest::rstest]
+fn test_snapshot_rejects_feature_mismatch() {
+    let mut snapshot: serde_json::Value =
+        serde_json::from_str(&Session::new().export_snapshot().unwrap()).unwrap();
+    snapshot["features"] = serde_json::json!(["unsupported_future_service"]);
+    let err = Session::from_snapshot(&snapshot.to_string()).unwrap_err();
+    assert!(matches!(
+        err,
+        crate::errors::session::SessionError::FeatureMismatch { .. }
+    ));
+}
+
+#[rstest::rstest]
+fn test_snapshot_preserves_service_auth() {
+    let session = Session::new();
+    let mut infos = crate::session::access_info::AccessInfos::default();
+    #[cfg(feature = "mycqu")]
+    {
+        infos.mycqu_access_info = Some(crate::session::access_info::MyCQUAccessInfo {
+            auth_header: "Bearer test_oauth_token_secret".to_string(),
+        });
+    }
+    let mut session = session.set_access_infos(infos);
+    session.is_login = true;
+
+    let snapshot = session.export_snapshot().unwrap();
+    let restored = Session::from_snapshot(&snapshot).unwrap();
+
+    assert!(restored.is_login());
+    #[cfg(feature = "mycqu")]
+    {
+        let mycqu_info = restored.access_infos().mycqu_access_info.as_ref().unwrap();
+        assert_eq!(mycqu_info.auth_header, "Bearer test_oauth_token_secret");
+    }
+}
+
+#[rstest::rstest]
+fn test_snapshot_preserves_ruishu_atomic_pair() {
+    let session = Session::new();
+    assert!(session.set_ruishu_challenge_from_page("$_ts.cd=\"atomic_cd\";$_ts.nsd=54321;"));
+    let sample_basearr = [0x5cu8; 160];
+    session.set_basearr(&sample_basearr).unwrap();
+
+    let snapshot = session.export_snapshot().unwrap();
+    let restored = Session::from_snapshot(&snapshot).unwrap();
+
+    assert_eq!(restored.basearr().as_deref(), Some(&sample_basearr[..]));
+    assert_eq!(
+        restored.ruishu_state.read().unwrap().challenge,
+        Some(("atomic_cd".to_string(), 54321))
+    );
+}
+
+#[rstest::rstest]
+fn test_snapshot_ruishu_challenge_only_rebuilds_with_mainjs() {
+    let session = Session::new();
+    assert!(session.set_ruishu_challenge_from_page("$_ts.cd=\"challenge_only\";$_ts.nsd=1111;"));
+    assert_eq!(session.basearr(), None);
+
+    let snapshot = session.export_snapshot().unwrap();
+    let restored = Session::from_snapshot(&snapshot).unwrap();
+    assert_eq!(restored.basearr(), None);
+
+    // 未设置 mainjs 时刷新应返回 RuishuError 要求 mainjs
+    let url = reqwest::Url::parse(SSO_URL).unwrap();
+    let res = restored.refresh_ruishu_cookie(&url);
+    assert!(matches!(
+        res,
+        Err(crate::errors::session::SessionError::RuishuError { .. })
+    ));
+}
+
+#[rstest::rstest]
+fn test_snapshot_ruishu_injected_basearr_only() {
+    let session = Session::new();
+    let injected = [0x88u8; 160];
+    session.set_basearr(&injected).unwrap();
+    assert_eq!(session.basearr().as_deref(), Some(&injected[..]));
+
+    let snapshot = session.export_snapshot().unwrap();
+    let restored = Session::from_snapshot(&snapshot).unwrap();
+    assert_eq!(restored.basearr().as_deref(), Some(&injected[..]));
+    assert!(restored.ruishu_state.read().unwrap().challenge.is_none());
+}
+#[rstest::rstest]
+fn test_snapshot_supports_288_basearr() {
+    let session = Session::new();
+    let sample_288 = vec![0x42u8; 288];
+    session.set_basearr(&sample_288).unwrap();
+    let snapshot = session.export_snapshot().unwrap();
+    let restored = Session::from_snapshot(&snapshot).unwrap();
+    assert_eq!(restored.basearr().as_deref(), Some(sample_288.as_slice()));
+}
+
+#[rstest::rstest]
+fn test_session_debug_redacts_secrets() {
+    let session = Session::new();
+    session
+        .set_cookies(
+            "https://sso.cqu.edu.cn/",
+            "secret_cookie_name=secret_cookie_value",
+        )
+        .unwrap();
+    let mut infos = crate::session::access_info::AccessInfos::default();
+    #[cfg(feature = "mycqu")]
+    {
+        infos.mycqu_access_info = Some(crate::session::access_info::MyCQUAccessInfo {
+            auth_header: "super_secret_token_12345".to_string(),
+        });
+    }
+    let session = session.set_access_infos(infos);
+    assert!(session.set_ruishu_challenge_from_page("$_ts.cd=\"secret_cd_hash\";$_ts.nsd=7777;"));
+    session.set_basearr(&[0xee; 160]).unwrap();
+
+    let debug_str = format!("{session:?}");
+    // 绝不输出任何内部秘密
+    assert!(!debug_str.contains("secret_cookie_name"));
+    assert!(!debug_str.contains("secret_cookie_value"));
+    assert!(!debug_str.contains("super_secret_token_12345"));
+    assert!(!debug_str.contains("secret_cd_hash"));
+    assert!(!debug_str.contains("eeeeeeee"));
 }

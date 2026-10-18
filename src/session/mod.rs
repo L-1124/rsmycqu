@@ -4,18 +4,20 @@ use std::sync::{Arc, RwLock};
 
 pub use client::Client;
 pub use reqwest;
-pub(crate) use reqwest::{
-    IntoUrl,
-    cookie::{CookieStore, Jar},
-    header,
-};
+pub(crate) use reqwest::{IntoUrl, header};
 
-use crate::{errors::session::SessionError, session::access_info::AccessInfos};
+use crate::{
+    errors::session::SessionError,
+    session::{access_info::AccessInfos, cookie_store::InternalCookieStore},
+};
 
 pub mod access_info;
 mod client;
+pub(crate) mod cookie_store;
 pub mod ruishu;
+pub(crate) mod snapshot;
 
+pub use snapshot::CURRENT_SNAPSHOT_VERSION;
 #[cfg(test)]
 mod tests;
 
@@ -27,11 +29,10 @@ struct RuishuState {
 
 /// 发起校园信息请求的会话
 ///
-/// [`rsmycqu`](crate)要求传入的[`reqwest::Client`]禁用自动重定向并启用cookies
-/// [`Session`]的`new`, `custom`方法保证了这一点
-#[derive(Clone, Debug)]
+/// [`Client`] 禁用自动重定向；Cookie 由会话独立管理。
+#[derive(Clone)]
 pub struct Session {
-    cookie_jar: Arc<Jar>,
+    cookie_jar: Arc<InternalCookieStore>,
     /// 是否已经通过[`sso`](crate::sso)登陆
     pub(crate) is_login: bool,
     /// 登陆后获取到的各服务访问信息
@@ -42,13 +43,37 @@ pub struct Session {
     pub(crate) ruishu_mainjs: Arc<RwLock<Option<String>>>,
 }
 
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let has_challenge = self
+            .ruishu_state
+            .read()
+            .map(|s| s.challenge.is_some())
+            .unwrap_or(false);
+        let has_basearr = self.basearr().is_some();
+        let has_mainjs = self
+            .ruishu_mainjs
+            .read()
+            .map(|m| m.is_some())
+            .unwrap_or(false);
+        let unexpired_cookies = self.cookie_jar.unexpired_count().unwrap_or(0);
+
+        f.debug_struct("Session")
+            .field("is_login", &self.is_login)
+            .field("unexpired_cookies", &unexpired_cookies)
+            .field("has_access_infos", &!self.access_infos.is_empty())
+            .field("has_ruishu_challenge", &has_challenge)
+            .field("has_basearr", &has_basearr)
+            .field("has_mainjs", &has_mainjs)
+            .finish()
+    }
+}
+
 impl Session {
-    /// 创建一个新的 `Session` 实例.
-    ///
-    /// 该示例存储了验证所需的信息，从而安全的在client中使用
+    /// 创建一个新的 `Session` 实例。
     pub fn new() -> Self {
         Session {
-            cookie_jar: Arc::new(Jar::default()),
+            cookie_jar: Arc::new(InternalCookieStore::new()),
             is_login: false,
             access_infos: AccessInfos::default(),
             ruishu_state: Arc::new(RwLock::new(RuishuState::default())),
@@ -79,7 +104,7 @@ impl Session {
         };
 
         loop {
-            let mut cookie_header = self.cookie_jar.cookies(request.url());
+            let mut cookie_header = self.cookie_jar.get_header_value(request.url())?;
             if is_cqu_host(request.url())
                 && request.url().path().contains("protected")
                 && !cookie_header.as_ref().is_some_and(has_cookie_t)
@@ -90,7 +115,7 @@ impl Session {
                     .any(has_cookie_t)
             {
                 self.refresh_ruishu_cookie(request.url())?;
-                cookie_header = self.cookie_jar.cookies(request.url());
+                cookie_header = self.cookie_jar.get_header_value(request.url())?;
             }
             if let Some(cookie_header) = cookie_header {
                 request.headers_mut().append(header::COOKIE, cookie_header);
@@ -121,7 +146,7 @@ impl Session {
                 .iter()
                 .filter_map(|v| v.to_str().ok())
             {
-                self.cookie_jar.add_cookie_str(cookie_str, response_url);
+                self.cookie_jar.add_cookie_str(cookie_str, response_url)?;
             }
 
             let Some(retry) = retry_request.take() else {
@@ -141,7 +166,7 @@ impl Session {
         let mut state = self
             .ruishu_state
             .write()
-            .map_err(|_| SessionError::RuishuError {
+            .map_err(|_| SessionError::LockError {
                 msg: "ruishu_state lock poisoned".to_string(),
             })?;
         let Some((cd, nsd)) = state.challenge.as_ref() else {
@@ -153,7 +178,7 @@ impl Session {
                 let mainjs_lock =
                     self.ruishu_mainjs
                         .read()
-                        .map_err(|_| SessionError::RuishuError {
+                        .map_err(|_| SessionError::LockError {
                             msg: "ruishu_mainjs lock poisoned".to_string(),
                         })?;
                 let mainjs = mainjs_lock
@@ -167,7 +192,7 @@ impl Session {
             }
         };
         self.cookie_jar
-            .add_cookie_str(&format!("CtLgrmkSWHBZP={cookie_t}; Path=/"), url);
+            .add_cookie_str(&format!("CtLgrmkSWHBZP={cookie_t}; Path=/"), url)?;
         Ok(true)
     }
 
@@ -179,7 +204,7 @@ impl Session {
         let url = url.into_url()?;
 
         for cookie in cookies.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-            self.cookie_jar.add_cookie_str(cookie, &url);
+            self.cookie_jar.add_cookie_str(cookie, &url)?;
         }
 
         Ok(())
@@ -202,10 +227,7 @@ impl Session {
     pub fn cookies<U: IntoUrl>(&self, url: U) -> Result<Option<String>, SessionError> {
         let url = url.into_url()?;
 
-        Ok(self
-            .cookie_jar
-            .cookies(&url)
-            .and_then(|value| value.to_str().ok().map(str::to_owned)))
+        self.cookie_jar.get_cookie_header(&url)
     }
 
     /// 注入当前挑战的内层密文，用于 412 时重建 Cookie T。
@@ -232,7 +254,7 @@ impl Session {
         let mut state = self
             .ruishu_state
             .write()
-            .map_err(|_| SessionError::RuishuError {
+            .map_err(|_| SessionError::LockError {
                 msg: "ruishu_state lock poisoned".to_string(),
             })?;
         state.basearr = Some(Arc::from(basearr));
