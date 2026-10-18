@@ -39,7 +39,7 @@ pub fn code_uid(mainjs: &str, nsd: u32, cd: &str) -> Result<u16, SessionError> {
 /// let nsd = 85762;
 /// let (cookie_t, basearr) = generate_cookie_t_auto(&mainjs, nsd, cd)?;
 /// assert!(!cookie_t.is_empty());
-/// assert_eq!(basearr.len(), 160);
+/// assert!(!basearr.is_empty());
 /// # Ok(())
 /// # }
 /// ```
@@ -47,7 +47,7 @@ pub fn generate_cookie_t_auto(
     mainjs: &str,
     nsd: u32,
     cd: &str,
-) -> Result<(String, [u8; 160]), SessionError> {
+) -> Result<(String, Vec<u8>), SessionError> {
     let keys = extract_keys(cd)?;
     keys.session_key()?;
     let mut coder = coder::Coder::new(nsd, mainjs);
@@ -598,21 +598,100 @@ fn decode_base64(str: &str) -> Result<Vec<u8>, SessionError> {
         })
 }
 
-/// 构造 225 字节固定明文结构
+pub(crate) const MAX_BASEARR_LEN: usize = (1 << 21) - 1;
+
+/// 编码符合瑞数规范的正规化 varint 长度（1~3 字节，拒绝非正规表达）
+fn encode_canonical_varint(len: usize) -> Result<([u8; 3], usize), SessionError> {
+    if len < 128 {
+        Ok(([len as u8, 0, 0], 1))
+    } else if len < 16384 {
+        Ok(([0x80 | ((len >> 8) as u8), (len & 0xff) as u8, 0], 2))
+    } else if len <= MAX_BASEARR_LEN {
+        Ok((
+            [
+                0xc0 | ((len >> 16) as u8),
+                ((len >> 8) & 0xff) as u8,
+                (len & 0xff) as u8,
+            ],
+            3,
+        ))
+    } else {
+        Err(SessionError::RuishuError {
+            msg: "length exceeds supported varint capacity".to_string(),
+        })
+    }
+}
+
+/// 解析符合瑞数规范的正规化 varint 长度，返回 `(length, bytes_consumed)`
+fn decode_canonical_varint(data: &[u8]) -> Result<(usize, usize), SessionError> {
+    if data.is_empty() {
+        return Err(SessionError::RuishuError {
+            msg: "empty buffer for varint length".to_string(),
+        });
+    }
+    let b0 = data[0];
+    if (b0 & 0x80) == 0 {
+        Ok((b0 as usize, 1))
+    } else if (b0 & 0xc0) == 0x80 {
+        if data.len() < 2 {
+            return Err(SessionError::RuishuError {
+                msg: "truncated 2-byte varint length".to_string(),
+            });
+        }
+        let b1 = data[1];
+        let len = (((b0 & 0x3f) as usize) << 8) | (b1 as usize);
+        if len < 128 {
+            return Err(SessionError::RuishuError {
+                msg: format!("non-canonical 2-byte varint length for {len}"),
+            });
+        }
+        Ok((len, 2))
+    } else if (b0 & 0xe0) == 0xc0 {
+        if data.len() < 3 {
+            return Err(SessionError::RuishuError {
+                msg: "truncated 3-byte varint length".to_string(),
+            });
+        }
+        let b1 = data[1];
+        let b2 = data[2];
+        let len = (((b0 & 0x1f) as usize) << 16) | ((b1 as usize) << 8) | (b2 as usize);
+        if len < 16384 {
+            return Err(SessionError::RuishuError {
+                msg: format!("non-canonical 3-byte varint length for {len}"),
+            });
+        }
+        Ok((len, 3))
+    } else {
+        Err(SessionError::RuishuError {
+            msg: format!("reserved or invalid varint prefix byte: 0x{b0:02x}"),
+        })
+    }
+}
+
+/// 构造变长明文结构
 fn build_plaintext(
     keys2: &[u8; 48],
-    basearr: &[u8; 160],
+    basearr: &[u8],
     t1: u32,
     t2: u32,
 ) -> Result<Vec<u8>, SessionError> {
-    let mut pt = Vec::with_capacity(225);
+    if basearr.is_empty() || !basearr.len().is_multiple_of(16) || basearr.len() > MAX_BASEARR_LEN {
+        return Err(SessionError::RuishuError {
+            msg: format!(
+                "invalid basearr length: expected non-empty multiple of 16 up to {MAX_BASEARR_LEN}, got {}",
+                basearr.len()
+            ),
+        });
+    }
+    let (encoded_len, length_bytes) = encode_canonical_varint(basearr.len())?;
+    let total_len = 15 + keys2.len() + length_bytes + basearr.len();
+    let mut pt = Vec::with_capacity(total_len);
     pt.extend_from_slice(&[0, 0, 0, 0, 4, 8]);
     pt.extend_from_slice(&t1.to_be_bytes());
     pt.extend_from_slice(&t2.to_be_bytes());
     pt.push(48);
     pt.extend_from_slice(keys2);
-    pt.push(0x80);
-    pt.push(160);
+    pt.extend_from_slice(&encoded_len[..length_bytes]);
     pt.extend_from_slice(basearr);
 
     let crc = crc32(&pt[4..]);
@@ -642,7 +721,7 @@ fn generate_pseudo_iv(t1: u32, t2: u32) -> [u8; 16] {
 /// 复用已解析的会话密钥，避免自动生成路径重复解析 `cd`。
 fn generate_cookie_t_with_keys(
     keys_info: &RuishuKeys,
-    basearr: &[u8; 160],
+    basearr: &[u8],
     t1: u32,
     t2: u32,
     iv: Option<[u8; 16]>,
@@ -668,7 +747,7 @@ fn generate_cookie_t_with_keys(
 /// [`generate_cookie_t_auto`]，由站点挑战自动计算这些值。
 pub fn generate_cookie_t(
     cd: &str,
-    basearr: &[u8; 160],
+    basearr: &[u8],
     t1: u32,
     t2: u32,
     iv: Option<[u8; 16]>,
@@ -680,7 +759,7 @@ pub fn generate_cookie_t(
 /// 用已有 basearr 与会话挑战里的 `keys[21]` 时间戳重算 Cookie T
 ///
 /// 时间戳取站点下发时间而非本地时钟：Tag 10 对时间敏感，服务端时间更贴近判定。
-pub(crate) fn refresh_cookie_t(cd: &str, basearr: &[u8; 160]) -> Result<String, SessionError> {
+pub(crate) fn refresh_cookie_t(cd: &str, basearr: &[u8]) -> Result<String, SessionError> {
     let keys = extract_keys(cd)?;
     let t1 = keys.key_num(21)?;
     generate_cookie_t_with_keys(&keys, basearr, t1, t1 + 2, None)
@@ -697,8 +776,21 @@ fn mask_bytes(mut seed: u32, n: usize) -> Vec<u8> {
     out
 }
 
-/// 纯算解密 Tag 6 服务端握手挑战（从 `keys[22]` 提取挑战明文）
+/// 纯算解密 Tag 6 服务端握手挑战（从 `keys[22]` 提取挑战明文）。
+///
+/// 当服务端未下发握手挑战（`keys[22]` 为空）时，
+/// 采用标准握手前缀 `[1, 0, 1, 0, 1, 1]` 与全零挑战字段。
 fn decrypt_tag6_challenge(keys22: &[u8], keys16: &[u8]) -> Result<[u8; 16], SessionError> {
+    let mut tag6 = [0u8; 16];
+    tag6[0] = 1;
+    tag6[2] = 1;
+    tag6[4] = 1;
+    tag6[5] = 1;
+
+    if keys22.is_empty() {
+        return Ok(tag6);
+    }
+
     let s = std::str::from_utf8(keys22).map_err(|e| SessionError::RuishuError {
         msg: format!("invalid keys[22] utf8: {e}"),
     })?;
@@ -712,37 +804,132 @@ fn decrypt_tag6_challenge(keys22: &[u8], keys16: &[u8]) -> Result<[u8; 16], Sess
             ),
         });
     }
-    let mut tag6 = [0u8; 16];
-    tag6[0] = 1;
-    tag6[2] = 1;
-    tag6[4] = 1;
-    tag6[5] = 1;
     tag6[6..14].copy_from_slice(&dec_mode2[..8]);
     Ok(tag6)
 }
 
-/// 标准客户端设备特征画像（macOS / Chrome 实测环境）
-pub const DEFAULT_TAG3_PROFILE: [u8; 55] = [
+/// 客户端设备特征画像模板（Windows 10 / Chromium 默认无交互环境，40 字节）
+///
+/// 包含平台标识（Win32）、屏幕几何（1365x856）、页面校验标记与空交互载荷。
+/// 当无指针交互时，交互载荷长度为 0（`[0x00, 0x00]`）。
+pub const DEFAULT_TAG3_PROFILE: [u8; 40] = [
+    0x01, 0x0a, 0x21, 0x80, // 子类型(1), 触摸点(10), eval.len(33), 128
+    0x00, 0x00, 0x00, 0x00, // 初始 UA CRC32（无 UA 请求头时置 0）
+    0x05, 0x57, 0x69, 0x6e, 0x33, 0x32, // 长度 5, "Win32"
+    0x00, 0x00, 0x0c, 0x2f, // 耗时占位 (~3119ms)
+    0x2e, 0x07, // 动态盐值占位
+    0x03, 0x00, // 固定标记
+    0x05, 0x55, 0x03, 0x58, 0x05, 0x55, // 几何特征 (1365, 856, 1365)
+    0xdc, 0x46, 0xe8, 0xfd, // 路径 CRC32 ("/LOGIN")
+    0x00, 0x00, 0x00, 0x00, // 查询参数 CRC32（无查询参数时置 0）
+    0x00, 0x00, // 交互载荷长度 (0: 无鼠标/触控交互事件)
+    0x00, 0x59, // 固定尾部
+];
+
+#[cfg(test)]
+const SAMPLED_WIN32_TAG3_PROFILE: [u8; 52] = [
+    0x01, 0x0a, 0x21, 0x80, // 子类型(1), 触摸点(10), eval.len(33), 128
+    0x00, 0x00, 0x00, 0x00, // 初始 UA CRC32（无 UA 请求头时置 0）
+    0x05, 0x57, 0x69, 0x6e, 0x33, 0x32, // 长度 5, "Win32"
+    0x00, 0x00, 0x0c, 0x2f, // 耗时占位 (~3119ms)
+    0x2e, 0x07, // 动态盐值占位
+    0x03, 0x00, // 固定标记
+    0x05, 0x55, 0x03, 0x58, 0x05, 0x55, // 几何特征 (1365, 856, 1365)
+    0xdc, 0x46, 0xe8, 0xfd, // 路径 CRC32 ("/LOGIN")
+    0x00, 0x00, 0x00, 0x00, // 查询参数 CRC32（无查询参数时置 0）
+    0x00, 0x0c, // 交互载荷长度 (12)
+    0x07, 0xdd, 0x14, 0x05, 0x5c, 0x56, 0x0f, 0xce, 0x9f, 0xb0, 0x27,
+    0x15, // 采样交互轨迹
+    0x00, 0x59, // 固定尾部
+];
+
+#[cfg(test)]
+const LEGACY_MAC_TAG3_PROFILE: [u8; 55] = [
     0x01, 0x00, 0x21, 0x80, 0x9f, 0xad, 0x00, 0xee, 0x08, 0x4d, 0x61, 0x63, 0x49, 0x6e, 0x74, 0x65,
     0x6c, 0x00, 0x00, 0x08, 0xc6, 0x2f, 0x09, 0x03, 0x00, 0x04, 0x00, 0x03, 0x00, 0x04, 0x00, 0xdc,
     0x46, 0xe8, 0xfd, 0x95, 0x32, 0xfb, 0x7a, 0x00, 0x0c, 0x3b, 0xdb, 0xfc, 0x0c, 0x68, 0x79, 0x91,
     0x0f, 0xa3, 0xbc, 0x91, 0x3b, 0x00, 0x59,
 ];
 
-/// 动态生成带随机耗时与 PRNG 随机盐的 Tag 3 客户端环境指纹
-fn generate_random_tag3(base_profile: Option<&[u8; 55]>) -> [u8; 55] {
-    let mut t3 = *base_profile.unwrap_or(&DEFAULT_TAG3_PROFILE);
+/// 动态构建符合瑞数环境指纹规范的 Tag 3 客户端环境画像。
+///
+/// # 动态字段推导
+/// - `user_agent`: 若提供，计算 IEEE CRC32 写入第 4..8 字节；若为 `None`，保留已有值（默认模板为 0，与原生 reqwest 空 UA 头部对齐）。
+/// - `platform`: 从第 8 字节读取平台字符串长度（如 Win32 为 5，MacIntel 为 8），动态定位后续字段偏移：
+///   - 运行耗时（4 字节）与随机盐值（2 字节）位于 `9 + plat_len`；
+///   - 页面路径（4 字节）与查询参数 CRC32（4 字节）位于 `9 + plat_len + 14`。
+/// - `page_url`: 若提供，解析路径与查询字符串并分别计算大写形式的 CRC32 写入；若为 `None`，保留已有值。
+pub fn build_tag3(
+    base_profile: Option<&[u8]>,
+    user_agent: Option<&str>,
+    page_url: Option<&str>,
+) -> Result<Vec<u8>, SessionError> {
+    let profile = base_profile.unwrap_or(&DEFAULT_TAG3_PROFILE);
+    if profile.len() < 9 || profile.len() > u8::MAX as usize {
+        return Err(SessionError::RuishuError {
+            msg: format!("invalid tag3 profile length: {}", profile.len()),
+        });
+    }
+    let plat_len = profile[8] as usize;
+    let elapsed_offset = 9 + plat_len;
+    if profile.len() < elapsed_offset + 26 {
+        return Err(SessionError::RuishuError {
+            msg: format!(
+                "tag3 profile too short for platform length {plat_len}: {} bytes, need at least {}",
+                profile.len(),
+                elapsed_offset + 26
+            ),
+        });
+    }
+    let motion_offset = elapsed_offset + 22;
+    let motion_len =
+        u16::from_be_bytes([profile[motion_offset], profile[motion_offset + 1]]) as usize;
+    if profile.len() != motion_offset + 2 + motion_len + 2 {
+        return Err(SessionError::RuishuError {
+            msg: "tag3 interaction payload length does not match profile".to_string(),
+        });
+    }
+    let mut t3 = profile.to_vec();
+
+    if let Some(ua) = user_agent {
+        let ua_crc = crc32(ua.as_bytes());
+        t3[4..8].copy_from_slice(&ua_crc.to_be_bytes());
+    }
+
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(2246);
-    t3[17..21].copy_from_slice(&(1500 + (nanos % 1800)).to_be_bytes());
-    t3[21] = (nanos >> 8) as u8;
-    t3[22] = nanos as u8;
-    t3
+    let elapsed = 1500 + (nanos % 1800);
+    t3[elapsed_offset..elapsed_offset + 4].copy_from_slice(&elapsed.to_be_bytes());
+    t3[elapsed_offset + 4] = (nanos >> 8) as u8;
+    t3[elapsed_offset + 5] = nanos as u8;
+
+    let path_offset = elapsed_offset + 14;
+    if let Some(url_str) = page_url {
+        let parsed = reqwest::Url::parse(url_str).map_err(|e| SessionError::RuishuError {
+            msg: format!("invalid page_url for tag3: {e}"),
+        })?;
+        let path = parsed.path().to_ascii_uppercase();
+        let path_crc = crc32(path.as_bytes());
+        t3[path_offset..path_offset + 4].copy_from_slice(&path_crc.to_be_bytes());
+
+        let search_crc = match parsed.query() {
+            Some(q) if !q.is_empty() => crc32(q.to_ascii_uppercase().as_bytes()),
+            _ => 0u32,
+        };
+        t3[path_offset + 4..path_offset + 8].copy_from_slice(&search_crc.to_be_bytes());
+    }
+
+    Ok(t3)
 }
 
-/// 纯算组装 10 个 TLV 指纹结构并双重加密生成 160 字节 innerCipher (basearr)
+/// 动态生成带随机耗时与 PRNG 随机盐的 Tag 3 客户端环境指纹
+pub(crate) fn generate_random_tag3(base_profile: Option<&[u8]>) -> Result<Vec<u8>, SessionError> {
+    build_tag3(base_profile, None, None)
+}
+
+/// 纯算组装 10 个 TLV 指纹结构并双重加密生成 innerCipher (basearr)
 ///
 /// # 动态字段边界
 /// - `code_uid` / `tag2`: 必须由 [`Coder`](coder::Coder) 算出（服务端对两者都有强校验）。
@@ -751,13 +938,13 @@ fn build_inner_cipher(
     t1: u32,
     code_uid: u16,
     tag2: [u8; 4],
-    tag3_profile: Option<&[u8; 55]>,
-) -> Result<[u8; 160], SessionError> {
+    tag3_profile: Option<&[u8]>,
+) -> Result<Vec<u8>, SessionError> {
     let keys2 = keys_info.session_key()?;
     let seed: u32 = keys_info.key_num(47)?;
     let counter: u32 = keys_info.key_num(19)?;
     let tag6 = decrypt_tag6_challenge(keys_info.key(22)?, keys_info.site_key()?)?;
-    let tag3 = generate_random_tag3(tag3_profile);
+    let tag3 = generate_random_tag3(tag3_profile)?;
 
     let mut tag10 = [0u8; 18];
     tag10[1] = 2;
@@ -793,38 +980,24 @@ fn build_inner_cipher(
         (13, &[0]),
     ];
 
-    let mut tlv_bytes = Vec::with_capacity(152);
+    let mut tlv_bytes = Vec::with_capacity(tlvs.iter().map(|(_, value)| 2 + value.len()).sum());
     for (tag, val) in tlvs {
         let sub_mask = mask_bytes(seed.wrapping_add(tag as u32).wrapping_add(1), val.len());
         tlv_bytes.push(tag);
         tlv_bytes.push(val.len() as u8);
         tlv_bytes.extend(val.iter().zip(&sub_mask).map(|(a, b)| a ^ b));
     }
-    if tlv_bytes.len() != 152 {
-        return Err(SessionError::RuishuError {
-            msg: format!("assembled tlv length != 152, got {}", tlv_bytes.len()),
-        });
+
+    let outer_mask = mask_bytes(seed, tlv_bytes.len());
+    for (byte, mask) in tlv_bytes.iter_mut().zip(&outer_mask) {
+        *byte ^= mask;
     }
-
-    let outer_mask = mask_bytes(seed, 152);
-    let mut x: Vec<u8> = tlv_bytes
-        .iter()
-        .zip(&outer_mask)
-        .map(|(a, b)| a ^ b)
-        .collect();
-
-    for (a, b) in x.iter_mut().zip(&keys2[..16]) {
+    for (a, b) in tlv_bytes.iter_mut().zip(&keys2[..16]) {
         *a ^= b;
     }
 
-    let inner_cipher = encrypt_mode1(&x, keys_info.key(17)?, None)?;
-    inner_cipher
-        .try_into()
-        .map_err(|v: Vec<u8>| SessionError::RuishuError {
-            msg: format!("inner_cipher len != 160, got {}", v.len()),
-        })
+    encrypt_mode1(&tlv_bytes, keys_info.key(17)?, None)
 }
-
 /// 基于会话 `cd` 与站点 `mainjs` 纯算 Cookie T（时间戳由调用方给定）
 ///
 /// `code_uid`（Tag 7）与 `tag2` 由本接口从 `mainjs` 与 `nsd` 内部算出。
@@ -834,7 +1007,7 @@ pub fn generate_cookie_t_pure(
     nsd: u32,
     t1: u32,
     t2: u32,
-    tag3_profile: Option<&[u8; 55]>,
+    tag3_profile: Option<&[u8]>,
     iv: Option<[u8; 16]>,
 ) -> Result<String, SessionError> {
     let keys_info = extract_keys(cd)?;
@@ -862,11 +1035,9 @@ pub struct DecryptedCookieT {
     pub t2: u32,
     /// 会话密钥 `keys[2]` (48 字节)
     pub keys2: Vec<u8>,
-    /// 是否包含调试标记 (0x80)
-    pub has_debug: bool,
-    /// 客户端环境特征数组 (160 字节)
-    pub basearr: [u8; 160],
-    /// 完整 225 字节解密原始明文
+    /// 客户端环境特征密文数组 (AES 块大小 16 的正整数倍)
+    pub basearr: Vec<u8>,
+    /// 完整解密原始明文
     pub raw_plaintext: Vec<u8>,
 }
 
@@ -886,50 +1057,74 @@ pub struct DecryptedCookieT {
 pub fn decrypt_cookie_t(cookie: &str) -> Result<DecryptedCookieT, SessionError> {
     let ct_bytes = decode_base64(cookie)?;
     let pt = decrypt_mode2(&ct_bytes, &K16, true)?;
-    if pt.len() < 65 {
+    if pt.len() < 63 + 1 + 16 {
         return Err(SessionError::RuishuError {
             msg: format!("decrypted plaintext too short: {} bytes", pt.len()),
         });
     }
+
     let crc = u32::from_be_bytes([pt[0], pt[1], pt[2], pt[3]]);
     let calc_crc = crc32(&pt[4..]);
-    let crc_valid = crc == calc_crc;
+    if crc != calc_crc {
+        return Err(SessionError::RuishuError {
+            msg: format!("CRC32 checksum mismatch: expected 0x{calc_crc:08x}, got 0x{crc:08x}"),
+        });
+    }
+    let crc_valid = true;
+
     let version = pt[4];
+    if version != 4 {
+        return Err(SessionError::RuishuError {
+            msg: format!("unsupported protocol version: expected 4, got {version}"),
+        });
+    }
+
+    let ts_len = pt[5];
+    if ts_len != 8 {
+        return Err(SessionError::RuishuError {
+            msg: format!("invalid timestamp block length: expected 8, got {ts_len}"),
+        });
+    }
+
     let t1 = u32::from_be_bytes([pt[6], pt[7], pt[8], pt[9]]);
     let t2 = u32::from_be_bytes([pt[10], pt[11], pt[12], pt[13]]);
+
     let k2_len = pt[14] as usize;
-    let k2_end = 15 + k2_len;
-    if k2_end > pt.len() {
+    if k2_len != 48 {
         return Err(SessionError::RuishuError {
-            msg: "truncated keys2 in plaintext".to_string(),
+            msg: format!("invalid keys2 length: expected 48, got {k2_len}"),
         });
     }
-    let keys2 = pt[15..k2_end].to_vec();
-    let flag_byte = pt
-        .get(k2_end)
-        .copied()
-        .ok_or_else(|| SessionError::RuishuError {
-            msg: "truncated flag byte in plaintext".to_string(),
-        })?;
-    let has_debug = (flag_byte & 0x80) != 0;
-    let ba_len = pt
-        .get(k2_end + 1)
-        .copied()
-        .ok_or_else(|| SessionError::RuishuError {
-            msg: "truncated basearr length in plaintext".to_string(),
-        })? as usize;
-    if ba_len != 160 {
+    let keys2 = pt[15..63].to_vec();
+
+    let (ba_len, varint_len) = decode_canonical_varint(&pt[63..])?;
+    if ba_len == 0 || !ba_len.is_multiple_of(16) || ba_len > MAX_BASEARR_LEN {
         return Err(SessionError::RuishuError {
-            msg: format!("basearr length must be 160, got {ba_len}"),
+            msg: format!(
+                "invalid basearr length in plaintext: expected non-empty multiple of 16 up to {MAX_BASEARR_LEN}, got {ba_len}"
+            ),
         });
     }
-    let ba_start = k2_end + 2;
-    let mut basearr = [0u8; 160];
-    basearr.copy_from_slice(pt.get(ba_start..ba_start + 160).ok_or_else(|| {
-        SessionError::RuishuError {
-            msg: "truncated basearr in plaintext".to_string(),
-        }
-    })?);
+
+    let expected_total_len = 63 + varint_len + ba_len;
+    if pt.len() < expected_total_len {
+        return Err(SessionError::RuishuError {
+            msg: format!(
+                "truncated basearr in plaintext: expected {expected_total_len} bytes, got {}",
+                pt.len()
+            ),
+        });
+    }
+    if pt.len() > expected_total_len {
+        return Err(SessionError::RuishuError {
+            msg: format!(
+                "extraneous trailing bytes in plaintext: expected {expected_total_len} bytes, got {}",
+                pt.len()
+            ),
+        });
+    }
+
+    let basearr = pt[63 + varint_len..expected_total_len].to_vec();
 
     Ok(DecryptedCookieT {
         crc,
@@ -938,7 +1133,6 @@ pub fn decrypt_cookie_t(cookie: &str) -> Result<DecryptedCookieT, SessionError> 
         t1,
         t2,
         keys2,
-        has_debug,
         basearr,
         raw_plaintext: pt,
     })
@@ -1020,7 +1214,6 @@ mod tests {
                 "keys2 mismatch for {name}"
             );
             assert_eq!(dec.basearr.len(), 160, "basearr len != 160 for {name}");
-            assert!(dec.has_debug, "has_debug != true for {name}");
         }
     }
 
@@ -1064,7 +1257,6 @@ mod tests {
             let expected = v["code_uid"].as_u64().unwrap() as u16;
 
             let (cookie_t, basearr) = generate_cookie_t_auto(&mainjs, nsd, cd).unwrap();
-            assert_eq!(cookie_t.len(), 343, "{name}");
 
             let dec = decrypt_cookie_t(&cookie_t).unwrap();
             assert!(dec.crc_valid, "{name}");
@@ -1097,13 +1289,16 @@ mod tests {
         let seed = keys.key_num(47).unwrap();
         let raw: Vec<u8> = x
             .iter()
-            .zip(&mask_bytes(seed, 152))
+            .zip(&mask_bytes(seed, x.len()))
             .map(|(a, b)| a ^ b)
             .collect();
         let mut pos = 0;
         while pos + 1 < raw.len() {
             let tag = raw[pos];
             let len = raw[pos + 1] as usize;
+            if pos + 2 + len > raw.len() {
+                break;
+            }
             if tag == want {
                 return raw[pos + 2..pos + 2 + len]
                     .iter()
@@ -1132,6 +1327,67 @@ mod tests {
                 "tag6 mismatch for {name}"
             );
         }
+    }
+
+    #[rstest::rstest]
+    fn test_decrypt_tag6_challenge_empty_keys22() {
+        let tag6 = decrypt_tag6_challenge(&[], &[0u8; 16]).unwrap();
+        assert_eq!(tag6, [1, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[rstest::rstest]
+    fn test_build_tag3_ua_and_url_injection() {
+        let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+        let url = "https://sso.cqu.edu.cn/login?service=https%3A%2F%2Fmy.cqu.edu.cn%2Fauthserver%2Fauthentication%2Fcas";
+        let t3 = build_tag3(None, Some(ua), Some(url)).unwrap();
+        assert_eq!(t3.len(), 40);
+        assert_eq!(&t3[4..8], &crc32(ua.as_bytes()).to_be_bytes());
+        assert_eq!(&t3[28..32], &crc32(b"/LOGIN").to_be_bytes());
+        let expected_search_crc =
+            crc32(b"SERVICE=HTTPS%3A%2F%2FMY.CQU.EDU.CN%2FAUTHSERVER%2FAUTHENTICATION%2FCAS");
+        assert_eq!(&t3[32..36], &expected_search_crc.to_be_bytes());
+        assert_eq!(&t3[36..38], &[0, 0]);
+        assert_eq!(&t3[38..40], &[0, 0x59]);
+    }
+
+    #[rstest::rstest]
+    #[case::windows(&DEFAULT_TAG3_PROFILE)]
+    #[case::sampled_win52(&SAMPLED_WIN32_TAG3_PROFILE)]
+    #[case::mac(&LEGACY_MAC_TAG3_PROFILE)]
+    fn test_tag3_randomization_preserves_other_profile_fields(#[case] profile: &[u8]) {
+        let t3 = build_tag3(Some(profile), None, None).unwrap();
+        let elapsed_offset = 9 + usize::from(profile[8]);
+        let elapsed =
+            u32::from_be_bytes(t3[elapsed_offset..elapsed_offset + 4].try_into().unwrap());
+        assert!((1500..3300).contains(&elapsed));
+        assert_eq!(&t3[..elapsed_offset], &profile[..elapsed_offset]);
+        assert_eq!(&t3[elapsed_offset + 6..], &profile[elapsed_offset + 6..]);
+    }
+
+    #[rstest::rstest]
+    #[case::empty(vec![])]
+    #[case::missing_platform_length(vec![0; 8])]
+    #[case::platform_overrun(vec![255; 52])]
+    #[case::oversized(vec![0; 256])]
+    #[case::truncated_motion(DEFAULT_TAG3_PROFILE[..39].to_vec())]
+    #[case::inconsistent_motion({
+        let mut profile = DEFAULT_TAG3_PROFILE.to_vec();
+        profile[37] = 1;
+        profile
+    })]
+    fn test_tag3_rejects_malformed_profiles(#[case] profile: Vec<u8>) {
+        assert!(matches!(
+            build_tag3(Some(&profile), None, None),
+            Err(SessionError::RuishuError { .. })
+        ));
+    }
+
+    #[rstest::rstest]
+    fn test_tag3_rejects_invalid_page_url() {
+        assert!(matches!(
+            build_tag3(None, None, Some("not a URL")),
+            Err(SessionError::RuishuError { .. })
+        ));
     }
 
     #[test]
@@ -1246,5 +1502,143 @@ mod tests {
             generate_cookie_t_pure(&cd, "", 107802, decoded.t1, decoded.t2, None, None),
             Err(SessionError::RuishuError { .. })
         ));
+    }
+    #[rstest::rstest]
+    fn test_canonical_varint_roundtrip() {
+        for len in [
+            1usize, 16, 127, 128, 160, 288, 1024, 4096, 16383, 16384, 65536,
+        ] {
+            let (encoded, size) = encode_canonical_varint(len).unwrap();
+            let (decoded_len, consumed) = decode_canonical_varint(&encoded[..size]).unwrap();
+            assert_eq!(decoded_len, len);
+            assert_eq!(consumed, size);
+        }
+    }
+
+    #[rstest::rstest]
+    fn test_canonical_varint_rejects_non_canonical_and_reserved() {
+        assert!(decode_canonical_varint(&[0x80, 0x10]).is_err());
+        assert!(decode_canonical_varint(&[0xc0, 0x00, 0x80]).is_err());
+        assert!(decode_canonical_varint(&[0xe0, 0x01]).is_err());
+        assert!(decode_canonical_varint(&[0xff]).is_err());
+        assert!(decode_canonical_varint(&[]).is_err());
+    }
+
+    #[rstest::rstest]
+    fn test_build_plaintext_and_decrypt_cookie_t_roundtrip_288() {
+        let f = fixture();
+        let s = &f.session_1;
+        let keys_info = extract_keys(&s.cd).unwrap();
+        let fake_288_basearr = vec![0x37u8; 288];
+        let t1 = 1700000000u32;
+        let t2 = t1 + 2;
+        let iv = [9u8; 16];
+        let cookie = generate_cookie_t(&s.cd, &fake_288_basearr, t1, t2, Some(iv)).unwrap();
+        let dec = decrypt_cookie_t(&cookie).unwrap();
+        assert!(dec.crc_valid);
+        assert_eq!(dec.version, 4);
+        assert_eq!(dec.t1, t1);
+        assert_eq!(dec.t2, t2);
+        assert_eq!(dec.keys2, keys_info.session_key().unwrap());
+        assert_eq!(dec.basearr, fake_288_basearr);
+    }
+
+    #[rstest::rstest]
+    fn test_decrypt_cookie_t_rejects_corrupted_crc() {
+        let f = fixture();
+        let s = &f.session_1;
+        let dec = decrypt_cookie_t(&s.cookie_t).unwrap();
+        let mut pt = dec.raw_plaintext.clone();
+        pt[0] ^= 0xff;
+        let iv_words = [1u32, 2, 3, 4];
+        let ct = encrypt_mode1(&pt, &K16, Some(iv_words)).unwrap();
+        let cookie = format!("a{}", encode_base64(&ct));
+        assert!(matches!(
+            decrypt_cookie_t(&cookie),
+            Err(SessionError::RuishuError { .. })
+        ));
+    }
+
+    #[rstest::rstest]
+    fn test_decrypt_cookie_t_rejects_invalid_version() {
+        let f = fixture();
+        let s = &f.session_1;
+        let dec = decrypt_cookie_t(&s.cookie_t).unwrap();
+        let mut pt = dec.raw_plaintext.clone();
+        pt[4] = 5;
+        let crc = crc32(&pt[4..]);
+        pt[0..4].copy_from_slice(&crc.to_be_bytes());
+        let iv_words = [1u32, 2, 3, 4];
+        let ct = encrypt_mode1(&pt, &K16, Some(iv_words)).unwrap();
+        let cookie = format!("a{}", encode_base64(&ct));
+        assert!(matches!(
+            decrypt_cookie_t(&cookie),
+            Err(SessionError::RuishuError { .. })
+        ));
+    }
+
+    #[rstest::rstest]
+    fn test_decrypt_cookie_t_rejects_invalid_ts_len() {
+        let f = fixture();
+        let s = &f.session_1;
+        let dec = decrypt_cookie_t(&s.cookie_t).unwrap();
+        let mut pt = dec.raw_plaintext.clone();
+        pt[5] = 9;
+        let crc = crc32(&pt[4..]);
+        pt[0..4].copy_from_slice(&crc.to_be_bytes());
+        let iv_words = [1u32, 2, 3, 4];
+        let ct = encrypt_mode1(&pt, &K16, Some(iv_words)).unwrap();
+        let cookie = format!("a{}", encode_base64(&ct));
+        assert!(matches!(
+            decrypt_cookie_t(&cookie),
+            Err(SessionError::RuishuError { .. })
+        ));
+    }
+
+    #[rstest::rstest]
+    fn test_decrypt_cookie_t_rejects_invalid_keys2_len() {
+        let f = fixture();
+        let s = &f.session_1;
+        let dec = decrypt_cookie_t(&s.cookie_t).unwrap();
+        let mut pt = dec.raw_plaintext.clone();
+        pt[14] = 47;
+        let crc = crc32(&pt[4..]);
+        pt[0..4].copy_from_slice(&crc.to_be_bytes());
+        let iv_words = [1u32, 2, 3, 4];
+        let ct = encrypt_mode1(&pt, &K16, Some(iv_words)).unwrap();
+        let cookie = format!("a{}", encode_base64(&ct));
+        assert!(matches!(
+            decrypt_cookie_t(&cookie),
+            Err(SessionError::RuishuError { .. })
+        ));
+    }
+
+    #[rstest::rstest]
+    fn test_decrypt_cookie_t_rejects_trailing_extra_bytes() {
+        let f = fixture();
+        let s = &f.session_1;
+        let dec = decrypt_cookie_t(&s.cookie_t).unwrap();
+        let mut pt = dec.raw_plaintext.clone();
+        pt.push(0x5a);
+        let crc = crc32(&pt[4..]);
+        pt[0..4].copy_from_slice(&crc.to_be_bytes());
+        let iv_words = [1u32, 2, 3, 4];
+        let ct = encrypt_mode1(&pt, &K16, Some(iv_words)).unwrap();
+        let cookie = format!("a{}", encode_base64(&ct));
+        assert!(matches!(
+            decrypt_cookie_t(&cookie),
+            Err(SessionError::RuishuError { .. })
+        ));
+    }
+
+    #[rstest::rstest]
+    fn test_build_plaintext_rejects_invalid_basearr_lengths() {
+        let keys2 = [0x11u8; 48];
+        assert!(build_plaintext(&keys2, &[], 100, 102).is_err());
+        assert!(build_plaintext(&keys2, &[0u8; 15], 100, 102).is_err());
+        assert!(build_plaintext(&keys2, &[0u8; 17], 100, 102).is_err());
+        assert!(build_plaintext(&keys2, &vec![0u8; MAX_BASEARR_LEN + 1], 100, 102).is_err());
+        assert!(build_plaintext(&keys2, &[0u8; 160], 100, 102).is_ok());
+        assert!(build_plaintext(&keys2, &[0u8; 288], 100, 102).is_ok());
     }
 }

@@ -233,7 +233,7 @@ async fn execute_retries_once_with_updated_cookies_and_original_body() {
         .unwrap();
     let decrypted = super::ruishu::decrypt_cookie_t(cookie_t).unwrap();
     assert!(decrypted.crc_valid);
-    assert_eq!(decrypted.basearr, basearr);
+    assert_eq!(decrypted.basearr, basearr.as_ref());
 }
 
 /// 浏览器实测向量：站点对 `protected` 请求的 CSRF 校验值算法对照
@@ -395,7 +395,7 @@ async fn protected_requests_initialize_shared_cookie_t_without_retrying_400() {
 fn changed_challenge_invalidates_inner_cipher(#[case] cd: &str, #[case] nsd: u32) {
     let session = Session::new();
     assert!(session.set_ruishu_challenge_from_page("$_ts.cd=\"first\";$_ts.nsd=1;"));
-    session.set_basearr(&[0x5a; 160]);
+    session.set_basearr(&[0x5a; 160]).unwrap();
     let shared = session.clone();
     assert!(shared.set_ruishu_challenge_from_page(&format!("$_ts.cd=\"{cd}\";$_ts.nsd={nsd};")));
     assert_eq!(session.basearr(), None);
@@ -405,11 +405,10 @@ fn changed_challenge_invalidates_inner_cipher(#[case] cd: &str, #[case] nsd: u32
 fn unchanged_or_invalid_challenge_preserves_inner_cipher() {
     let session = Session::new();
     assert!(session.set_ruishu_challenge_from_page("$_ts.cd=\"first\";$_ts.nsd=1;"));
-    session.set_basearr(&[0x5a; 160]);
-    assert!(session.set_ruishu_challenge_from_page("$_ts.cd=\"first\";$_ts.nsd=1;"));
-    assert_eq!(session.basearr(), Some([0x5a; 160]));
+    session.set_basearr(&[0x5a; 160]).unwrap();
+    assert_eq!(session.basearr().as_deref(), Some(&[0x5a; 160][..]));
     assert!(!session.set_ruishu_challenge_from_page("$_ts.cd=\"second\";"));
-    assert_eq!(session.basearr(), Some([0x5a; 160]));
+    assert_eq!(session.basearr().as_deref(), Some(&[0x5a; 160][..]));
 }
 
 #[test]
@@ -434,7 +433,7 @@ fn changed_challenge_regenerates_inner_cipher() {
         assert_eq!(session.basearr(), None);
         assert!(session.refresh_ruishu_cookie(&url).unwrap());
         let basearr = session.basearr().unwrap();
-        assert_ne!(previous, Some(basearr));
+        assert_ne!(previous.as_deref(), Some(basearr.as_ref()));
         let cookie = session.cookies(SSO_URL).unwrap().unwrap();
         let token = cookie
             .split(';')
@@ -442,7 +441,7 @@ fn changed_challenge_regenerates_inner_cipher() {
             .unwrap();
         let decoded = super::ruishu::decrypt_cookie_t(token).unwrap();
         assert!(decoded.crc_valid);
-        assert_eq!(decoded.basearr, basearr);
+        assert_eq!(decoded.basearr, basearr.as_ref());
         previous = Some(basearr);
     }
 }
@@ -460,7 +459,7 @@ fn changed_challenge_cannot_reuse_cipher_without_mainjs() {
             vector["nsd"]
         )));
         if name == "session_1" {
-            session.set_basearr(&[0x5a; 160]);
+            session.set_basearr(&[0x5a; 160]).unwrap();
         }
     }
     let result = session.refresh_ruishu_cookie(&reqwest::Url::parse(SSO_URL).unwrap());
@@ -468,4 +467,20 @@ fn changed_challenge_cannot_reuse_cipher_without_mainjs() {
         result,
         Err(super::SessionError::RuishuError { .. })
     ));
+}
+
+#[rstest::rstest]
+fn test_session_set_basearr_rejects_invalid_lengths() {
+    let session = Session::new();
+    assert!(session.set_basearr(&[]).is_err());
+    assert!(session.set_basearr(&[0u8; 15]).is_err());
+    assert!(session.set_basearr(&[0u8; 17]).is_err());
+    assert!(session.set_basearr(&[0u8; 160]).is_ok());
+    assert!(session.set_basearr(&[0u8; 288]).is_ok());
+    assert!(session.set_basearr(&vec![0u8; 4096]).is_ok());
+    assert!(
+        session
+            .set_basearr(&vec![0u8; super::ruishu::MAX_BASEARR_LEN + 1])
+            .is_err()
+    );
 }

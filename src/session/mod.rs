@@ -21,7 +21,7 @@ mod tests;
 
 #[derive(Debug, Default)]
 struct RuishuState {
-    basearr: Option<[u8; 160]>,
+    basearr: Option<Arc<[u8]>>,
     challenge: Option<(String, u32)>,
 }
 
@@ -140,8 +140,8 @@ impl Session {
         let Some((cd, nsd)) = state.challenge.as_ref() else {
             return Ok(false);
         };
-        let (cookie_t, basearr) = match state.basearr {
-            Some(basearr) => (ruishu::refresh_cookie_t(cd, &basearr)?, basearr),
+        let cookie_t = match &state.basearr {
+            Some(basearr) => ruishu::refresh_cookie_t(cd, basearr.as_ref())?,
             None => {
                 let mainjs_lock =
                     self.ruishu_mainjs
@@ -154,10 +154,11 @@ impl Session {
                     .ok_or_else(|| SessionError::RuishuError {
                         msg: "basearr missing and Session::set_mainjs was not called".to_string(),
                     })?;
-                ruishu::generate_cookie_t_auto(mainjs, *nsd, cd)?
+                let (cookie_t, basearr) = ruishu::generate_cookie_t_auto(mainjs, *nsd, cd)?;
+                state.basearr = Some(Arc::from(basearr.into_boxed_slice()));
+                cookie_t
             }
         };
-        state.basearr = Some(basearr);
         self.cookie_jar
             .add_cookie_str(&format!("CtLgrmkSWHBZP={cookie_t}; Path=/"), url);
         Ok(true)
@@ -205,13 +206,30 @@ impl Session {
     /// ```
     /// # use rsmycqu::session::Session;
     /// let session = Session::new();
-    /// session.set_basearr(&[0x5a; 160]);
+    /// session.set_basearr(&[0x5a; 160]).unwrap();
     /// assert_eq!(session.basearr().unwrap().len(), 160);
     /// ```
-    pub fn set_basearr(&self, basearr: &[u8; 160]) {
-        if let Ok(mut state) = self.ruishu_state.write() {
-            state.basearr = Some(*basearr);
+    pub fn set_basearr(&self, basearr: &[u8]) -> Result<(), SessionError> {
+        if basearr.is_empty()
+            || !basearr.len().is_multiple_of(16)
+            || basearr.len() > ruishu::MAX_BASEARR_LEN
+        {
+            return Err(SessionError::RuishuError {
+                msg: format!(
+                    "invalid basearr length: expected non-empty multiple of 16 up to {}, got {}",
+                    ruishu::MAX_BASEARR_LEN,
+                    basearr.len()
+                ),
+            });
         }
+        let mut state = self
+            .ruishu_state
+            .write()
+            .map_err(|_| SessionError::RuishuError {
+                msg: "ruishu_state lock poisoned".to_string(),
+            })?;
+        state.basearr = Some(Arc::from(basearr));
+        Ok(())
     }
 
     /// 从已有的 Cookie T (`CtLgrmkSWHBZP`) 中反向提取并记住 basearr。
@@ -228,21 +246,15 @@ impl Session {
     /// ```
     pub fn set_basearr_from_cookie(&self, cookie_t: &str) -> Result<(), SessionError> {
         let dec = ruishu::decrypt_cookie_t(cookie_t)?;
-        if !dec.crc_valid {
-            return Err(SessionError::RuishuError {
-                msg: "Cookie T crc mismatch".to_string(),
-            });
-        }
-        self.set_basearr(&dec.basearr);
-        Ok(())
+        self.set_basearr(&dec.basearr)
     }
 
     /// 获取当前会话记住的 basearr
-    pub fn basearr(&self) -> Option<[u8; 160]> {
+    pub fn basearr(&self) -> Option<Arc<[u8]>> {
         self.ruishu_state
             .read()
             .ok()
-            .and_then(|state| state.basearr)
+            .and_then(|state| state.basearr.clone())
     }
 
     /// 注入站点外层脚本（mainjs）源码，用于无 basearr 时补算。
