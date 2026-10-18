@@ -17,6 +17,7 @@ pub(crate) mod cookie_store;
 pub mod ruishu;
 pub(crate) mod snapshot;
 
+pub use access_info::ServiceAuthorizationStatus;
 pub use snapshot::CURRENT_SNAPSHOT_VERSION;
 #[cfg(test)]
 mod tests;

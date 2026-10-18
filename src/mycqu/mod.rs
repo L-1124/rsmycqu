@@ -19,7 +19,9 @@ pub mod course;
 pub mod enroll;
 pub mod exam;
 pub mod score;
-mod utils;
+pub mod status;
+pub(crate) mod utils;
+pub use status::*;
 
 #[cfg(test)]
 mod tests;
