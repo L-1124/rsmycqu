@@ -22,8 +22,9 @@ use crate::{
 #[allow(clippy::module_inception)]
 mod card;
 mod dorm;
-mod utils;
-
+pub mod status;
+pub(crate) mod utils;
+pub use status::*;
 #[cfg(test)]
 mod tests;
 
