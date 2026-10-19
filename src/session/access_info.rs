@@ -29,6 +29,13 @@ pub struct CardAccessInfo {
     pub(crate) synjones_auth: Option<String>,
 }
 
+/// aTrust 门户的访问信息
+#[cfg(feature = "atrust")]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ATrustAccessInfo {
+    pub(crate) csrf_token: String,
+}
+
 /// 包含各模块支持服务所需的登陆信息
 #[derive(Debug, Clone, Eq, PartialEq, Default, Serialize, Deserialize)]
 pub struct AccessInfos {
@@ -36,6 +43,8 @@ pub struct AccessInfos {
     pub(crate) mycqu_access_info: Option<MyCQUAccessInfo>,
     #[cfg(feature = "card")]
     pub(crate) card_access_info: Option<CardAccessInfo>,
+    #[cfg(feature = "atrust")]
+    pub(crate) atrust_access_info: Option<ATrustAccessInfo>,
 }
 
 impl AccessInfos {
@@ -47,6 +56,10 @@ impl AccessInfos {
         }
         #[cfg(feature = "card")]
         if self.card_access_info.is_some() {
+            return false;
+        }
+        #[cfg(feature = "atrust")]
+        if self.atrust_access_info.is_some() {
             return false;
         }
         true

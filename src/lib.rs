@@ -5,6 +5,7 @@
 //! - [重庆大学单点登陆(SSO)](sso)
 //! - [重庆大学教务网相关功能](mycqu)
 //!     - [获取访问教务网API权限](mycqu::access_mycqu)
+//! - 重庆大学 aTrust 代理访问（`atrust` feature）
 //!
 
 #![warn(missing_docs)]
@@ -26,6 +27,9 @@ pub mod mycqu;
 
 #[cfg(feature = "card")]
 pub mod card;
+
+#[cfg(feature = "atrust")]
+pub mod atrust;
 
 // #[cfg(feature = "library")]
 // pub mod library;

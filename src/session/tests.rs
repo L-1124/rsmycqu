@@ -781,6 +781,18 @@ fn test_snapshot_rejects_feature_mismatch() {
         err,
         crate::errors::session::SessionError::FeatureMismatch { .. }
     ));
+
+    #[cfg(not(feature = "atrust"))]
+    {
+        let mut snapshot: serde_json::Value =
+            serde_json::from_str(&Session::new().export_snapshot().unwrap()).unwrap();
+        snapshot["access_infos"]["atrust"] = serde_json::json!({"csrf_token": "secret"});
+        let err = Session::from_snapshot(&snapshot.to_string()).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::errors::session::SessionError::FeatureMismatch { .. }
+        ));
+    }
 }
 
 #[rstest::rstest]
@@ -791,6 +803,12 @@ fn test_snapshot_preserves_service_auth() {
     {
         infos.mycqu_access_info = Some(crate::session::access_info::MyCQUAccessInfo {
             auth_header: "Bearer test_oauth_token_secret".to_string(),
+        });
+    }
+    #[cfg(feature = "atrust")]
+    {
+        infos.atrust_access_info = Some(crate::session::access_info::ATrustAccessInfo {
+            csrf_token: "test-csrf".to_string(),
         });
     }
     let mut session = session.set_access_infos(infos);
@@ -804,6 +822,11 @@ fn test_snapshot_preserves_service_auth() {
     {
         let mycqu_info = restored.access_infos().mycqu_access_info.as_ref().unwrap();
         assert_eq!(mycqu_info.auth_header, "Bearer test_oauth_token_secret");
+    }
+    #[cfg(feature = "atrust")]
+    {
+        let atrust_info = restored.access_infos().atrust_access_info.as_ref().unwrap();
+        assert_eq!(atrust_info.csrf_token, "test-csrf");
     }
 }
 

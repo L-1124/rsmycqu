@@ -52,6 +52,8 @@ pub(crate) struct AccessInfosSnapshot {
     pub(crate) mycqu: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) card: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) atrust: Option<serde_json::Value>,
 }
 
 /// 瑞数状态快照
@@ -100,6 +102,9 @@ impl Session {
         if cfg!(feature = "card") {
             features.push("card".to_string());
         }
+        if cfg!(feature = "atrust") {
+            features.push("atrust".to_string());
+        }
         if cfg!(feature = "blocking") {
             features.push("blocking".to_string());
         }
@@ -135,6 +140,23 @@ impl Session {
                         })?
                 }
                 #[cfg(not(feature = "card"))]
+                {
+                    None
+                }
+            },
+            atrust: {
+                #[cfg(feature = "atrust")]
+                {
+                    self.access_infos
+                        .atrust_access_info
+                        .as_ref()
+                        .map(serde_json::to_value)
+                        .transpose()
+                        .map_err(|_| SessionError::SnapshotError {
+                            msg: "failed to serialize atrust access info".to_string(),
+                        })?
+                }
+                #[cfg(not(feature = "atrust"))]
                 {
                     None
                 }
@@ -210,7 +232,7 @@ impl Session {
     ///
     /// # 校验规则
     /// - 快照版本必须受当前代码支持（当前版本为 1），否则返回 [`SessionError::UnsupportedVersion`]。
-    /// - 检查特性兼容性：如果快照中包含当前构建未启用的特性授权（如 mycqu / card），
+    /// - 检查特性兼容性：如果快照中包含当前构建未启用的特性授权（如 mycqu / card / atrust），
     ///   或声明了未启用的特性，返回 [`SessionError::FeatureMismatch`]。
     /// - 数据完整性：结构损坏、格式异常或 `basearr` 长度不符合规范（非空、16 的整数倍且在限制内）时，
     ///   返回 [`SessionError::SnapshotError`]。错误信息中**绝不包含**任何敏感明文或载荷。
@@ -254,6 +276,13 @@ impl Session {
                         });
                     }
                 }
+                "atrust" => {
+                    if !cfg!(feature = "atrust") {
+                        return Err(SessionError::FeatureMismatch {
+                            msg: format!("snapshot requires feature '{feat}' which is not enabled"),
+                        });
+                    }
+                }
                 "blocking" => {
                     if !cfg!(feature = "blocking") {
                         return Err(SessionError::FeatureMismatch {
@@ -281,6 +310,12 @@ impl Session {
                 msg: "snapshot contains card authorization".to_string(),
             });
         }
+        #[cfg(not(feature = "atrust"))]
+        if data.access_infos.atrust.is_some() {
+            return Err(SessionError::FeatureMismatch {
+                msg: "snapshot contains atrust authorization".to_string(),
+            });
+        }
         let access_infos = AccessInfos {
             #[cfg(feature = "mycqu")]
             mycqu_access_info: data
@@ -299,6 +334,15 @@ impl Session {
                 .transpose()
                 .map_err(|_| SessionError::SnapshotError {
                     msg: "invalid card authorization structure".to_string(),
+                })?,
+            #[cfg(feature = "atrust")]
+            atrust_access_info: data
+                .access_infos
+                .atrust
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|_| SessionError::SnapshotError {
+                    msg: "invalid atrust authorization structure".to_string(),
                 })?,
         };
 

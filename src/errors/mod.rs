@@ -15,6 +15,9 @@ pub mod mycqu;
 #[cfg(feature = "card")]
 pub mod card;
 
+#[cfg(feature = "atrust")]
+pub mod atrust;
+
 mod sealed {
     #[cfg(feature = "sso")]
     use crate::errors::sso;
@@ -29,6 +32,9 @@ mod sealed {
 
     #[cfg(feature = "card")]
     impl Sealed for crate::errors::card::CardError {}
+
+    #[cfg(feature = "atrust")]
+    impl Sealed for crate::errors::atrust::ATrustError {}
 
     #[cfg(test)]
     impl Sealed for super::DummyTestError {}

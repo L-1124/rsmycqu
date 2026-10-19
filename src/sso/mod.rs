@@ -643,7 +643,7 @@ pub async fn send_second_factor_code(
         SecondFactorKind::Mail => send_mail_code(client, session, contact).await,
     }
 }
-#[cfg(any(feature = "mycqu", feature = "card"))]
+#[cfg(any(feature = "mycqu", feature = "card", feature = "atrust"))]
 /// 使用登陆了统一身份认证的账号获取指定服务许可
 pub(super) async fn access_services(
     client: &Client,
